@@ -1,0 +1,33 @@
+# 模型与 checkpoint，避免占满磁盘
+emo_classifier_base/
+emo_classifier_lora/
+sft_emo_model/
+outputs/
+eval_tmp/
+eval_tmp_base/
+*.ckpt
+*.pt
+*.bin
+*.safetensors
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# 数据与缓存（按需取消注释）
+# data/counseling_dialogue/
+# weibo*.jsonl
+# combined_*.jsonl
+
+# IDE
+.idea/
+.cursor/
+*.swp
+*~
+
+# 系统
+.DS_Store
+Thumbs.db

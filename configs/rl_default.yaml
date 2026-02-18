@@ -1,0 +1,52 @@
+seed: 42
+
+model:
+  # 这里一般加载 SFT 之后的模型权重
+  sft_model_path: "outputs/sft"
+  dtype: "bfloat16"
+  use_lora: true
+
+data:
+  # RL 训练用的数据，可以是：
+  # - 带有评分的咨询对话
+  # - 或者偏好数据（better / worse 回复）
+  train_file: "data/rl/train.jsonl"
+  max_prompt_length: 1024
+  max_response_length: 512
+  num_proc: 4
+
+rl:
+  algo: "ppo"  # 或 "dpo" / "kto" 等
+
+  # PPO 相关参数
+  ppo:
+    batch_size: 64
+    mini_batch_size: 8
+    ppo_epochs: 4
+    learning_rate: 1.0e-6
+    gamma: 1.0
+    lam: 0.95
+    clip_range: 0.2
+    kl_penalty_coef: 0.02
+
+  # DPO 相关参数（如果使用）
+  dpo:
+    beta: 0.1
+    learning_rate: 2.0e-6
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 8
+
+reward:
+  # 这里只是接口占位：你可以使用以下几种方式组合奖励：
+  # - 规则奖励：是否使用共情语句、是否复述来访者情绪、是否避免危险建议
+  # - 模型奖励：用一个小模型打分“共情程度”、“安全性”
+  # - 人类偏好：来自标注者的比较数据
+  type: ["rule", "model"]
+
+training:
+  output_dir: "outputs/rl"
+  total_steps: 5000
+  logging_steps: 50
+  save_steps: 500
+  save_total_limit: 3
+

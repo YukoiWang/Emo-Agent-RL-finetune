@@ -1,0 +1,44 @@
+# 心理咨询对话 SFT（在 RL 微调之前使用）
+# 用法：先在本配置上跑 SFT，得到 output_dir 的模型，再将该路径作为 RL 的 sft_model_path
+seed: 42
+
+model:
+  base_model_name: "Qwen/Qwen2.5-7B-Instruct"
+  dtype: "bfloat16"
+  use_lora: true
+  lora:
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+data:
+  # 心理咨询对话数据集：本地 jsonl 或 HuggingFace 数据集名（见下方说明）
+  train_file: "data/counseling_dialogue/train.jsonl"
+  eval_file: "data/counseling_dialogue/eval.jsonl"
+  # 若使用 HF 数据集，可设 data_source: "huggingface", dataset_name: "your_org/counseling_zh"
+  max_seq_length: 2048
+  num_proc: 4
+
+training:
+  output_dir: "outputs/sft_counseling"
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 1.0e-5
+  num_train_epochs: 3
+  warmup_ratio: 0.03
+  logging_steps: 50
+  eval_steps: 500
+  save_steps: 1000
+  save_total_limit: 3
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  lr_scheduler_type: "cosine"
+  bf16: true
+
+conversation:
+  system_prompt: |
+    你是一名专业的心理咨询师，擅长共情、倾听和安全、温暖的沟通。
+    你不会提供医疗诊断，也不会鼓励任何危险行为。
+    你会使用温柔、尊重、无评判的语言，帮助来访者梳理情绪。
