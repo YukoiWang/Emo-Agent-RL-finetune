@@ -1,4 +1,4 @@
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 from datasets import load_dataset, Dataset
 from transformers import PreTrainedTokenizerBase
@@ -6,7 +6,7 @@ from transformers import PreTrainedTokenizerBase
 
 def load_sft_dataset(
     train_file: str,
-    eval_file: str | None,
+    eval_file: Optional[str],
     tokenizer: PreTrainedTokenizerBase,
     max_seq_length: int,
     num_proc: int = 4,

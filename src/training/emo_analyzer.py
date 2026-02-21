@@ -51,7 +51,28 @@ def build_emo_analyzer(
         trust_remote_code=True,
         torch_dtype=torch.float16,
     )
-    model = PeftModel.from_pretrained(model, adapter_path)
+    # PEFT 旧版本不支持 eva_config，在临时目录生成兼容的 config 后加载
+    import json
+    import shutil
+    import tempfile
+    _adapter_cfg = os.path.join(adapter_path, "adapter_config.json")
+    if os.path.isfile(_adapter_cfg):
+        with open(_adapter_cfg, "r", encoding="utf-8") as f:
+            _cfg = json.load(f)
+        _cfg.pop("eva_config", None)
+        with tempfile.TemporaryDirectory() as _tmp:
+            for _f in os.listdir(adapter_path):
+                _src = os.path.join(adapter_path, _f)
+                _dst = os.path.join(_tmp, _f)
+                if os.path.isfile(_src):
+                    if _f == "adapter_config.json":
+                        with open(_dst, "w", encoding="utf-8") as f:
+                            json.dump(_cfg, f, indent=2, ensure_ascii=False)
+                    else:
+                        shutil.copy2(_src, _dst)
+            model = PeftModel.from_pretrained(model, _tmp)
+    else:
+        model = PeftModel.from_pretrained(model, adapter_path)
     model.eval()
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"

@@ -1,5 +1,20 @@
 import argparse
+import os
+import sys
 from pathlib import Path
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+# 若 /tmp 有空间，可将 HF 缓存放到 /tmp 避免磁盘满
+_cache = os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE")
+if not _cache and os.path.exists("/tmp"):
+    _tmp_cache = "/tmp/hf_cache"
+    os.makedirs(_tmp_cache, exist_ok=True)
+    os.environ.setdefault("HF_HOME", _tmp_cache)
+    os.environ.setdefault("TRANSFORMERS_CACHE", _tmp_cache)
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", _tmp_cache)
 
 import yaml
 
@@ -27,10 +42,13 @@ def main() -> None:
         cfg = yaml.safe_load(f)
 
     algo = cfg.get("rl", {}).get("algo", "ppo")
-    if algo != "ppo":
-        raise ValueError(f"当前示例仅实现 PPO，收到 algo={algo}")
-
-    run_ppo_training(cfg)
+    if algo == "ppo":
+        run_ppo_training(cfg)
+    elif algo == "grpo":
+        from src.training.grpo_training import run_grpo_training
+        run_grpo_training(cfg)
+    else:
+        raise ValueError(f"不支持的 RL 算法: {algo}，当前支持 ppo, grpo")
 
 
 if __name__ == "__main__":

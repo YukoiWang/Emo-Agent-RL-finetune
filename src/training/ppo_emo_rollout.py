@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch as T
 
-from .hard_player_simulator_dsv3 import PlayerSimulator
+from .hard_player_simulator_dsv3 import PlayerSimulator, PlayerSimulatorWithPlanning, build_player_simulator_with_planning
 
 
 def run_multi_turn_rollout_single(
@@ -20,26 +20,46 @@ def run_multi_turn_rollout_single(
     critic,
     tokenizer,
     user_llm_fn: Callable[[List[Dict[str, str]]], str],
-    emo_analyzer_fn: Callable[[str, str, str], Dict[str, Any]],
-    device: T.device,
+    emo_analyzer_fn: Optional[Callable[[str, str, str], Dict[str, Any]]] = None,
+    device: T.device = None,
     max_turns: int = 15,
     max_new_tokens_per_turn: int = 256,
     do_sample: bool = True,
     temperature: float = 0.8,
     top_p: float = 1.0,
+    use_planning_emo: bool = False,
+    target: str = "eq",
+    sft_model_path: Optional[str] = None,
+    planning_llm_fn: Optional[Callable[[List[Dict[str, str]]], str]] = None,
 ) -> Tuple[T.Tensor, T.Tensor, T.Tensor, T.Tensor, float, List[float]]:
     """
     单条样本的多轮对话 rollout。
+    use_planning_emo: True 时用 planning_reply（LLM prompt）做情感分析，此时 emo_analyzer_fn 可省略。
+    sft_model_path: planning 用本地 SFT 基座时指定路径；或直接传 planning_llm_fn。
     返回: query_ids (1, q_len), response_ids (1, r_len), response_mask (1, r_len),
           log_probs (1, r_len), values (1, r_len), emo_point, emo_point_turns。
     """
     pad_id = getattr(tokenizer, "pad_token_id", tokenizer.eos_token_id)
-    sim = PlayerSimulator(profile, user_llm_fn, emo_analyzer_fn, initial_emo_point=50.0)
+    device = device or (next(actor_ref.parameters(), T.tensor(0)).device if hasattr(actor_ref, "parameters") else T.device("cpu"))
 
-    # 首轮：先让用户说一句话（模拟器生成开场）
-    first_messages = sim._build_system_and_start()
-    first_user = user_llm_fn(first_messages + [{"role": "user", "content": "（我最近有些事想和你聊聊。）"}])
-    first_user = (first_user or "").strip() or "我最近有些事想和你聊聊。"
+    if use_planning_emo:
+        sim = build_player_simulator_with_planning(
+            profile=profile,
+            player_llm_fn=user_llm_fn,
+            planning_llm_fn=planning_llm_fn,
+            sft_model_path=sft_model_path,
+            target=target,
+            initial_emo_point=50.0,
+            device=str(device) if device else None,
+        )
+        first_user = sim.generate_first_message()
+    else:
+        if emo_analyzer_fn is None:
+            raise ValueError("use_planning_emo=False 时需提供 emo_analyzer_fn")
+        sim = PlayerSimulator(profile, user_llm_fn, emo_analyzer_fn, initial_emo_point=50.0)
+        first_messages = sim._build_system_and_start()
+        first_user = user_llm_fn(first_messages + [{"role": "user", "content": "（我最近有些事想和你聊聊。）"}])
+        first_user = (first_user or "").strip() or "我最近有些事想和你聊聊。"
     sim.dialog.append({"role": "user", "content": first_user})
     sim.emo_point_turns = [sim.emo_point]
 
@@ -146,13 +166,17 @@ def run_multi_turn_rollout_batch(
     critic,
     tokenizer,
     user_llm_fn: Callable[[List[Dict[str, str]]], str],
-    emo_analyzer_fn: Callable[[str, str, str], Dict[str, Any]],
-    device: T.device,
+    emo_analyzer_fn: Optional[Callable[[str, str, str], Dict[str, Any]]] = None,
+    device: T.device = None,
     max_turns: int = 15,
     max_new_tokens_per_turn: int = 256,
     do_sample: bool = True,
     temperature: float = 0.8,
     top_p: float = 1.0,
+    use_planning_emo: bool = False,
+    target: str = "eq",
+    sft_model_path: Optional[str] = None,
+    planning_llm_fn: Optional[Callable[[List[Dict[str, str]]], str]] = None,
 ) -> Dict[str, Any]:
     """
     batch_items: 每项 {"profile", "prompt", "idx"}。
@@ -176,11 +200,15 @@ def run_multi_turn_rollout_batch(
             do_sample=do_sample,
             temperature=temperature,
             top_p=top_p,
+            use_planning_emo=use_planning_emo,
+            target=item.get("target", target),
+            sft_model_path=sft_model_path,
+            planning_llm_fn=planning_llm_fn,
         )
         results.append(out)
 
     # Pad 成 batch
-        pad_id = getattr(tokenizer, "pad_token_id", tokenizer.eos_token_id)
+    pad_id = getattr(tokenizer, "pad_token_id", tokenizer.eos_token_id)
     q_list = [r[0].squeeze(0) for r in results]
     r_list = [r[1].squeeze(0) for r in results]
     m_list = [r[2].squeeze(0) for r in results]
@@ -253,6 +281,10 @@ def collect_rollouts_emo(
     do_sample: bool = True,
     temperature: float = 0.8,
     top_p: float = 1.0,
+    use_planning_emo: bool = False,
+    target: str = "eq",
+    sft_model_path: Optional[str] = None,
+    planning_llm_fn: Optional[Callable[[List[Dict[str, str]]], str]] = None,
     # mode3 三段式
     step: Optional[int] = None,
     S1: Optional[int] = None,
@@ -261,6 +293,7 @@ def collect_rollouts_emo(
 ) -> Tuple[T.Tensor, T.Tensor]:
     """
     多轮对话 rollout + reward 计算 + 写入 memory。
+    use_planning_emo: True 时用 planning_reply（LLM prompt）做情感分析。
     get_ref_log_probs_fn: (query_ids, query_mask, response_ids, response_mask) -> ref_log_probs (batch, resp_len)。
     mode3 时需传入 step, S1, S2, warmup_steps。
     返回 (original_reward_tensor, penalized_reward_tensor) 供 trainer 记录。
@@ -280,6 +313,10 @@ def collect_rollouts_emo(
         do_sample=do_sample,
         temperature=temperature,
         top_p=top_p,
+        use_planning_emo=use_planning_emo,
+        target=target,
+        sft_model_path=sft_model_path,
+        planning_llm_fn=planning_llm_fn,
     )
     non_tensor = gen_batch.get("non_tensor_batch") or {}
     emo_points = non_tensor.get("emo_point", [0.0] * len(batch_items))

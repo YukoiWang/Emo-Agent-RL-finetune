@@ -1,10 +1,10 @@
 """
-PPO 微调 LLM 用的组件：
-- PPOMemory：rollout buffer + GAE
-- Critic：value head 框架
-- RewardModel：奖励模型 / 规则奖励框架
-- ActorRefRollout：reference + rollout + actor 合并为一个类
-- PPOTrainer：训练循环骨架
+PPO components for LLM fine-tuning:
+- PPOMemory: rollout buffer + GAE
+- Critic: value head
+- RewardModel: learnable / rule-based reward interface
+- ActorRefRollout: reference + rollout + actor in one class
+- PPOTrainer: training loop
 """
 import copy
 import torch as T
@@ -15,8 +15,8 @@ from typing import List, Optional, Tuple, Union, Callable
 
 class PPOMemory:
     """
-    LLM PPO 的 rollout buffer。
-    按「序列」存：每条是 (query, response, log_probs, values, reward, ref_log_probs)。
+    Rollout buffer for LLM PPO.
+    Stores per sequence: (query, response, log_probs, values, reward, ref_log_probs).
     """
 
     def __init__(
@@ -29,14 +29,14 @@ class PPOMemory:
         self.lam = lam
         self.device = device or T.device("cpu")
 
-        self.queries: List[T.Tensor] = []           # 每个 [query_len]
-        self.query_masks: List[T.Tensor] = []       # 每个 [query_len]
-        self.responses: List[T.Tensor] = []         # 每个 [response_len]，仅生成的 token ids
-        self.response_masks: List[T.Tensor] = []   # 每个 [response_len]
-        self.log_probs: List[T.Tensor] = []         # 每个 [response_len]，当前 policy 的 log prob
-        self.values: List[T.Tensor] = []            # 每个 [response_len]，critic 的 value
-        self.rewards: List[float] = []              # 每个序列一个标量 reward
-        self.ref_log_probs: List[T.Tensor] = []     # 每个 [response_len]，ref 模型的 log prob（KL 用）
+        self.queries: List[T.Tensor] = []           # [query_len] each
+        self.query_masks: List[T.Tensor] = []       # [query_len] each
+        self.responses: List[T.Tensor] = []         # [response_len] each, generated token ids only
+        self.response_masks: List[T.Tensor] = []   # [response_len] each
+        self.log_probs: List[T.Tensor] = []         # [response_len] each, current policy log prob
+        self.values: List[T.Tensor] = []            # [response_len] each, critic value
+        self.rewards: List[float] = []              # scalar reward per sequence
+        self.ref_log_probs: List[T.Tensor] = []     # [response_len] each, ref log prob for KL
 
     def store(
         self,
@@ -49,7 +49,7 @@ class PPOMemory:
         reward: float,
         ref_log_probs: T.Tensor,
     ) -> None:
-        """存一条 rollout（可为一整批压成一条，或逐条调用）。"""
+        """Store one rollout (can be a whole batch or per-item)."""
         self.queries.append(query_ids.detach().to(self.device))
         self.query_masks.append(query_mask.detach().to(self.device))
         self.responses.append(response_ids.detach().to(self.device))
@@ -70,7 +70,7 @@ class PPOMemory:
         rewards: T.Tensor,
         ref_log_probs: T.Tensor,
     ) -> None:
-        """存一整批 rollout（batch 中每条序列单独 append）。"""
+        """Store a batch of rollouts (each sequence appended separately)."""
         for i in range(query_ids.size(0)):
             self.store(
                 query_ids[i],
@@ -84,7 +84,7 @@ class PPOMemory:
             )
 
     def clear(self) -> None:
-        """清空 buffer，准备下一轮 rollout。"""
+        """Clear buffer for next rollout."""
         self.queries.clear()
         self.query_masks.clear()
         self.responses.clear()
@@ -102,9 +102,9 @@ class PPOMemory:
         last_value: Optional[T.Tensor] = None,
     ) -> Tuple[List[T.Tensor], List[T.Tensor]]:
         """
-        用 GAE 计算每条序列的 advantage 和 return。
-        返回 (advantages, returns)，均为 list of 1d tensor，与 response 长度对齐。
-        last_value: 可选，最后一条的 next value（用于 bootstrap）。
+        Compute advantage and return per sequence using GAE.
+        Returns (advantages, returns), both list of 1d tensors aligned with response length.
+        last_value: optional next value for bootstrap.
         """
         advantages: List[T.Tensor] = []
         returns: List[T.Tensor] = []
@@ -136,12 +136,10 @@ class PPOMemory:
         last_value: Optional[T.Tensor] = None,
     ) -> dict:
         """
-        取出当前 buffer 的全部数据，用于 PPO 更新。
-        若 compute_gae=True，会先算 advantages/returns，再返回。
-        返回 dict，包含：
-          - query_ids, query_masks, response_ids, response_masks
-          - log_probs, ref_log_probs, values
-          - rewards, advantages, returns（后两者在 compute_gae=True 时有）
+        Get all data from buffer for PPO update.
+        If compute_gae=True, computes advantages/returns before returning.
+        Returns dict with: query_ids, query_masks, response_ids, response_masks,
+        log_probs, ref_log_probs, values, rewards, advantages, returns (when compute_gae=True).
         """
         out = {
             "queries": self.queries,
@@ -166,8 +164,8 @@ class PPOMemory:
         last_value: Optional[T.Tensor] = None,
     ) -> dict:
         """
-        与 get() 相同；若传 mini_batch_size，则随机取子集做 mini-batch 更新。
-        不传则返回全部（等价 get()）。
+        Same as get(); if mini_batch_size given, randomly sample a mini-batch.
+        If not given, returns all (equivalent to get()).
         """
         full = self.get(compute_gae=compute_gae, last_value=last_value)
         if mini_batch_size is None or mini_batch_size >= len(self):
@@ -180,13 +178,13 @@ class PPOMemory:
 
 
 # ---------------------------------------------------------------------------
-# Critic：value head，输入 hidden states，输出每位置的 value
+# Critic: value head, maps hidden states to value per position
 # ---------------------------------------------------------------------------
 
 class Critic(nn.Module):
     """
-    Value head：输入 (batch, seq_len, hidden_size)，输出 (batch, seq_len)。
-    通常与 Actor 共享 backbone，只多这一层；或单独 backbone+head。
+    Value head: (batch, seq_len, hidden_size) -> (batch, seq_len).
+    Typically shares backbone with Actor, or has separate backbone+head.
     """
 
     def __init__(self, base_model, hidden_size, dropout=0.0):
@@ -204,22 +202,29 @@ class Critic(nn.Module):
     def forward(self, input_ids: T.Tensor, attention_mask: T.Tensor) -> T.Tensor:
         """
         input_ids: (batch, seq_len), attention_mask: (batch, seq_len)
-        返回: (batch, seq_len) value  per position
+        Returns: (batch, seq_len) value per position
         """
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-        hidden_states = outputs.last_hidden_state
+        outputs = self.base_model(
+            input_ids=input_ids, attention_mask=attention_mask,
+            return_dict=True, output_hidden_states=True,
+        )
+        if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+            hidden_states = outputs.last_hidden_state
+        else:
+            hidden_states = outputs.hidden_states[-1]
+        hidden_states = hidden_states.to(self.head[0].weight.dtype)
         values = self.head(hidden_states).squeeze(-1)
         return values
 
 
 # ---------------------------------------------------------------------------
-# RewardModel：奖励模型 / 规则奖励的统一接口
+# RewardModel: learnable / rule-based reward interface
 # ---------------------------------------------------------------------------
 
 class RewardModel(nn.Module):
     """
-    可学习的奖励模型：输入 (input_ids, attention_mask) 或 文本列表，
-    输出每条一个标量 reward。子类实现 forward 或 compute_reward。
+    Learnable reward model: (input_ids, attention_mask) or text list -> scalar reward per item.
+    Subclasses implement forward or compute_reward.
     """
 
     def __init__(self):
@@ -231,20 +236,20 @@ class RewardModel(nn.Module):
         attention_mask: T.Tensor,
     ) -> T.Tensor:
         """
-        input_ids: (batch, seq_len)，一般为 prompt+response 拼接
+        input_ids: (batch, seq_len), typically prompt+response
         attention_mask: (batch, seq_len)
-        返回: (batch,) 标量 reward
+        Returns: (batch,) scalar reward
         """
-        raise NotImplementedError("子类实现或使用 RuleRewardModel")
+        raise NotImplementedError("Subclass or use RuleRewardModel")
 
     def compute_reward(self, texts: List[str]) -> List[float]:
-        """基于文本的接口：list[str] -> list[float]，便于规则奖励或外部模型打分。"""
-        raise NotImplementedError("子类实现或使用 RuleRewardModel")
+        """Text-based interface: list[str] -> list[float]."""
+        raise NotImplementedError("Subclass or use RuleRewardModel")
 
 
 class RuleRewardModel(RewardModel):
     """
-    规则奖励：不包含可学习参数，用 callable 或内置规则。
+    Rule-based reward: no learnable params, uses callable.
     """
 
     def __init__(self, reward_fn: Callable[[List[str]], List[float]]):
@@ -252,26 +257,26 @@ class RuleRewardModel(RewardModel):
         self.reward_fn = reward_fn
 
     def forward(self, input_ids: T.Tensor, attention_mask: T.Tensor) -> T.Tensor:
-        raise NotImplementedError("RuleRewardModel 请用 compute_reward(texts)")
+        raise NotImplementedError("RuleRewardModel: use compute_reward(texts)")
 
     def compute_reward(self, texts: List[str]) -> List[float]:
         return self.reward_fn(texts)
 
 
 # ---------------------------------------------------------------------------
-# ActorRefRollout：reference + rollout + actor 合并为一个类（骨架，供学习实现）
+# ActorRefRollout: reference + rollout + actor in one class
 # ---------------------------------------------------------------------------
 
 class ActorRefRollout(nn.Module):
     """
-    把 reference、rollout、actor 合并成一个类：
-    - actor：可训练的 policy（因果 LM），用于生成和更新
-    - ref：冻结的 reference，只用于算 ref_log_probs（KL 惩罚）
-    - rollout：用 actor 做自回归生成（collect 阶段）
+    Combines reference, rollout, and actor:
+    - actor: trainable policy (causal LM) for generation and update
+    - ref: frozen reference for ref_log_probs (KL penalty)
+    - rollout: actor does autoregressive generation (collect phase)
 
-    约定：外部传入的 causal_lm 需支持：
-    - .generate(input_ids, attention_mask, ...) 返回 generated_ids
-    - 前向返回 logits / hidden_states，用于算 log_probs 和喂给 Critic
+    causal_lm must support:
+    - .generate(input_ids, attention_mask, ...) -> generated_ids
+    - forward returns logits / hidden_states for log_probs and Critic
     """
 
     def __init__(
@@ -282,7 +287,7 @@ class ActorRefRollout(nn.Module):
         device: Optional[T.device] = None,
     ):
         super().__init__()
-        # TODO: 保存 actor、ref（冻结拷贝）、tokenizer、ref_sync_interval、device、_step
+        # actor, ref (frozen copy), tokenizer, ref_sync_interval, device, _step
         self.actor = causal_lm
         self.ref = copy.deepcopy(causal_lm)
         for param in self.ref.parameters():
@@ -293,14 +298,14 @@ class ActorRefRollout(nn.Module):
         self._step = 0
 
     def sync_ref_from_actor(self) -> None:
-        """把 ref 参数同步为当前 actor 的拷贝（可选，用于 periodic ref update）。"""
+        """Sync ref params from current actor (optional periodic ref update)."""
         state_dict = copy.deepcopy(self.actor.state_dict())
         self.ref.load_state_dict(state_dict)
         for param in self.ref.parameters():
             param.requires_grad = False
 
     def maybe_sync_ref(self) -> None:
-        """若设置了 ref_sync_interval，到步数则 sync。"""
+        """Sync ref when ref_sync_interval steps reached."""
         if self.ref_sync_interval is None:
             return
         self._step += 1
@@ -316,9 +321,9 @@ class ActorRefRollout(nn.Module):
         response_mask: T.Tensor,
     ) -> T.Tensor:
         """
-        用任意 causal LM 做前向，算 response 位置的 token log_probs。
-        logits[:, t, :] 预测的是 input_ids[:, t+1]，故 position t+1 的 log_prob 从 logits[:, t, :] 取。
-        返回: (batch, full_len)，仅 response 位置非零。
+        Compute response-position token log_probs from causal LM.
+        logits[:, t, :] predicts input_ids[:, t+1], so log_prob at t+1 from logits[:, t, :].
+        Returns: (batch, full_len), only response positions non-zero.
         """
         outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
         logits = outputs.logits  # (batch, seq_len, vocab_size)
@@ -340,11 +345,11 @@ class ActorRefRollout(nn.Module):
         response_mask: T.Tensor,
     ) -> T.Tensor:
         """
-        用当前 actor 对已生成的序列算 response 部分的 log_probs。
-        input_ids: (batch, full_len) = query + response 拼接
+        Get actor log_probs for response part of generated sequence.
+        input_ids: (batch, full_len) = query + response
         attention_mask: (batch, full_len)
-        response_mask: (batch, full_len)，仅 response 位置为 1
-        返回: (batch, full_len)，仅 response 位置有效，其余为 0。
+        response_mask: (batch, full_len), 1 at response positions
+        Returns: (batch, full_len), only response positions valid.
         """
         log_probs = self._log_probs_from_model(self.actor, input_ids, attention_mask, response_mask)
         return log_probs
@@ -356,8 +361,8 @@ class ActorRefRollout(nn.Module):
         response_mask: T.Tensor,
     ) -> T.Tensor:
         """
-        用 ref 对已生成的序列算 response 部分的 log_probs。
-        形状约定同 get_actor_log_probs。
+        Get ref log_probs for response part.
+        Same shape convention as get_actor_log_probs.
         """
         log_probs = self._log_probs_from_model(self.ref, input_ids, attention_mask, response_mask)
         return log_probs
@@ -372,8 +377,8 @@ class ActorRefRollout(nn.Module):
         temperature: float = 1.0,
     ) -> Tuple[T.Tensor, T.Tensor, T.Tensor]:
         """
-        Rollout：用 actor 自回归生成 response，再前向一次得到 response 的 log_probs。
-        返回: response_ids (batch, resp_len), response_mask (batch, resp_len), log_probs (batch, resp_len)。
+        Rollout: actor autoregressively generates response, then forward for log_probs.
+        Returns: response_ids, response_mask, log_probs (each batch, resp_len).
         """
         pad_token_id = getattr(self.tokenizer, "pad_token_id", self.tokenizer.eos_token_id)
         gen_outputs = self.actor.generate(
@@ -385,7 +390,7 @@ class ActorRefRollout(nn.Module):
             temperature=temperature if do_sample else 1.0,
             pad_token_id=pad_token_id,
         )
-        # HF generate 返回 tensor 或带 .sequences 的对象
+        # HF generate returns tensor or .sequences
         generated = gen_outputs.sequences if hasattr(gen_outputs, "sequences") else gen_outputs
         query_len = query_ids.size(1)
         full_ids = generated
@@ -401,7 +406,7 @@ class ActorRefRollout(nn.Module):
         return response_ids, response_mask, log_probs
 
     def parameters_for_optimizer(self) -> list:
-        """返回需要训练的参数（仅 actor）。"""
+        """Return trainable params (actor only)."""
         return list(self.actor.parameters())
 
     def reward_collection(
@@ -412,8 +417,8 @@ class ActorRefRollout(nn.Module):
         response_mask: T.Tensor,
     ) -> T.Tensor:
         """
-        用 reward_model 根据 query+response 解码文本算 reward。
-        返回: (batch,) 标量 reward。若 reward_model 只有 compute_reward(texts)，则先 decode 再调用。
+        Compute reward via reward_model from query+response decoded text.
+        Returns: (batch,) scalar reward. Decodes then calls compute_reward(texts).
         """
         texts = []
         for i in range(query_ids.size(0)):
@@ -430,9 +435,9 @@ class ActorRefRollout(nn.Module):
 
 class PPOTrainer:
     """
-    手搓 LLM PPO 训练器。负责：采样 prompt → 生成 response → 算 reward / log_probs / values
-    → 写入 buffer → 多 epoch mini-batch PPO 更新。
-    依赖：ActorRefRollout（actor+ref+rollout）、Critic、RewardModel、PPOMemory、dataloader。
+    PPO trainer for LLM: sample prompt -> generate response -> reward / log_probs / values
+    -> write to buffer -> multi-epoch mini-batch PPO update.
+    Depends on: ActorRefRollout, Critic, RewardModel, PPOMemory, dataloader.
     """
 
     def __init__(
@@ -463,54 +468,227 @@ class PPOTrainer:
 
     def generate(self, query_ids: T.Tensor, query_mask: T.Tensor) -> Tuple[T.Tensor, T.Tensor, T.Tensor, T.Tensor]:
         """
-        用 ActorRefRollout 做 rollout，返回 response_ids, response_mask, log_probs, values。
-        values 需用 critic + actor 的 hidden_states 在外部或内部算。
+        Rollout via ActorRefRollout, return response_ids, response_mask, log_probs, values.
+        values computed from critic + actor hidden states.
         """
-        raise NotImplementedError("actor_ref.generate + critic 算 values")
+        response_ids, response_mask, log_probs = self.actor_ref.generate(
+            query_ids,
+            query_mask,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=True,
+            top_p=1.0,
+            temperature=1.0,
+        )
+        pad_id = getattr(self.actor_ref.tokenizer, "pad_token_id", self.actor_ref.tokenizer.eos_token_id)
+        query_len = query_ids.size(1)
+        full_ids = T.cat([query_ids, response_ids], dim=1)
+        full_attn = T.ones_like(full_ids, dtype=T.float32, device=full_ids.device)
+        full_attn[:, :query_len] = query_mask.to(T.float32)
+        full_attn[:, query_len:] = response_mask.to(T.float32)
+        values_full = self.critic(full_ids, full_attn)
+        values = values_full[:, query_len:]
+        return response_ids, response_mask, log_probs, values
 
     def get_ref_log_probs(self, query_ids: T.Tensor, query_mask: T.Tensor, response_ids: T.Tensor, response_mask: T.Tensor) -> T.Tensor:
-        """用 ActorRefRollout.ref 算 response 的 log prob。"""
-        raise NotImplementedError("actor_ref.get_ref_log_probs")
+        """Get ref log_probs for response via ActorRefRollout.ref."""
+        query_len = query_ids.size(1)
+        full_ids = T.cat([query_ids, response_ids], dim=1)
+        full_attn = T.ones_like(full_ids, dtype=T.float32, device=full_ids.device)
+        full_attn[:, :query_len] = query_mask.to(T.float32)
+        full_attn[:, query_len:] = response_mask.to(T.float32)
+        full_resp_mask = T.zeros_like(full_ids, dtype=T.float32, device=full_ids.device)
+        full_resp_mask[:, query_len:] = response_mask.to(T.float32)
+        full_log_probs = self.actor_ref.get_ref_log_probs(full_ids, full_attn, full_resp_mask)
+        return full_log_probs[:, query_len:]
 
-    def collect_rollouts(self, dataloader) -> None:
+    def collect_rollouts(
+        self,
+        dataloader,
+        max_prompt_length: int = 1024,
+        batches_per_rollout: int = 1,
+    ) -> None:
         """
-        从 dataloader 取若干 batch 的 prompt，生成 response，算 reward / log_probs / values / ref_log_probs，
-        写入 memory；凑够一个 rollout batch 后返回（由调用方决定取多少 batch）。
+        Fetch batches from dataloader -> generate response -> reward / log_probs / values / ref_log_probs
+        -> store in memory. Caller controls how many batches per rollout.
         """
-        raise NotImplementedError("循环 dataloader → generate → reward_fn → get_ref_log_probs → memory.store_batch")
+        tokenizer = self.actor_ref.tokenizer
+        pad_id = getattr(tokenizer, "pad_token_id", tokenizer.eos_token_id)
+        it = iter(dataloader)
+        for _ in range(batches_per_rollout):
+            try:
+                batch = next(it)
+            except StopIteration:
+                it = iter(dataloader)
+                batch = next(it)
+            if isinstance(batch, (list, tuple)):
+                texts = [b["user"] if isinstance(b, dict) else b for b in batch]
+                enc = tokenizer(
+                    texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=max_prompt_length,
+                    pad_to_multiple_of=1,
+                    return_attention_mask=True,
+                )
+                query_ids = enc["input_ids"].to(self.device)
+                query_mask = enc.get("attention_mask")
+                if query_mask is not None:
+                    query_mask = query_mask.to(self.device)
+                else:
+                    query_mask = (query_ids != pad_id).to(T.float32)
+            elif isinstance(batch, dict) and "user" in batch:
+                texts = batch["user"] if isinstance(batch["user"], list) else [batch["user"]]
+                enc = tokenizer(
+                    texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=max_prompt_length,
+                    pad_to_multiple_of=1,
+                    return_attention_mask=True,
+                )
+                query_ids = enc["input_ids"].to(self.device)
+                query_mask = enc.get("attention_mask")
+                if query_mask is not None:
+                    query_mask = query_mask.to(self.device)
+                else:
+                    query_mask = (query_ids != pad_id).to(T.float32)
+            else:
+                query_ids = batch["input_ids"].to(self.device)
+                query_mask = batch.get("attention_mask")
+                if query_mask is not None:
+                    query_mask = query_mask.to(self.device)
+                else:
+                    query_mask = (query_ids != pad_id).to(T.float32)
+
+            with T.no_grad():
+                response_ids, response_mask, log_probs, values = self.generate(query_ids, query_mask)
+                ref_log_probs = self.get_ref_log_probs(query_ids, query_mask, response_ids, response_mask)
+                texts = []
+                for i in range(query_ids.size(0)):
+                    r_len = int(response_mask[i].sum().item())
+                    ids = response_ids[i, :r_len] if r_len > 0 else response_ids[i]
+                    t = tokenizer.decode(ids, skip_special_tokens=True)
+                    texts.append(t)
+                rewards = self.reward_model.compute_reward(texts)
+                rewards_t = T.tensor(rewards, dtype=T.float32, device=self.device)
+            self.memory.store_batch(
+                query_ids, query_mask, response_ids, response_mask,
+                log_probs, values, rewards_t, ref_log_probs,
+            )
 
     def _build_full_sequence_batch(self, batch: dict, pad_token_id: int) -> Tuple[T.Tensor, T.Tensor, T.Tensor, List[int], List[int], int]:
         """
-        把 memory 里取出的 list 形式的 mini_batch 拼成 padded 的 full 序列。
-        返回: full_ids, full_attn, full_resp_mask, qlens, resp_lens, max_r。
+        Build padded full sequences from memory mini_batch lists.
+        Returns: full_ids, full_attn, full_resp_mask, qlens, resp_lens, max_r.
         """
-        raise NotImplementedError
+        queries = batch["queries"]
+        query_masks = batch["query_masks"]
+        responses = batch["responses"]
+        response_masks = batch["response_masks"]
+        qlens = [q.size(0) for q in queries]
+        resp_lens = [r.size(0) for r in responses]
+        full_seqs = [T.cat([q, r], dim=0) for q, r in zip(queries, responses)]
+        max_len = max(s.size(0) for s in full_seqs)
+        batch_size = len(full_seqs)
+        full_ids = T.full(
+            (batch_size, max_len), pad_token_id,
+            dtype=queries[0].dtype, device=self.device,
+        )
+        full_attn = T.zeros(batch_size, max_len, dtype=T.float32, device=self.device)
+        full_resp_mask = T.zeros(batch_size, max_len, dtype=T.float32, device=self.device)
+        for i, seq in enumerate(full_seqs):
+            L = seq.size(0)
+            full_ids[i, :L] = seq.to(self.device)
+            qlen, rlen = qlens[i], resp_lens[i]
+            full_attn[i, :qlen] = query_masks[i].to(T.float32).to(self.device)
+            full_attn[i, qlen:qlen + rlen] = response_masks[i].to(T.float32).to(self.device)
+            full_resp_mask[i, qlen:qlen + rlen] = response_masks[i].to(T.float32).to(self.device)
+        max_r = max(resp_lens)
+        return full_ids, full_attn, full_resp_mask, qlens, resp_lens, max_r
 
     def ppo_step(self, batch: dict) -> dict:
         """
-        用 buffer 里取出的一个 mini_batch 做一次 PPO 更新：policy clip loss + value loss + KL 惩罚，
-        然后 backward + optimizer.step。
-        返回 stats dict（policy_loss, value_loss, kl_loss, total_loss）。
+        One PPO update on mini_batch: policy clip loss + value loss + KL penalty,
+        then backward + optimizer.step.
+        Returns stats dict: policy_loss, value_loss, kl_loss, total_loss.
         """
-        raise NotImplementedError
+        pad_id = getattr(self.actor_ref.tokenizer, "pad_token_id", self.actor_ref.tokenizer.eos_token_id)
+        full_ids, full_attn, full_resp_mask, qlens, resp_lens, _ = self._build_full_sequence_batch(batch, pad_id)
+
+        old_log_probs_list = batch["log_probs"]
+        ref_log_probs_list = batch["ref_log_probs"]
+        advantages_list = batch["advantages"]
+        returns_list = batch["returns"]
+
+        old_log_probs, _ = _pad_list_to_tensor(old_log_probs_list, 0.0, self.device)
+        ref_log_probs, _ = _pad_list_to_tensor(ref_log_probs_list, 0.0, self.device)
+        advantages, adv_mask = _pad_list_to_tensor(advantages_list, 0.0, self.device)
+        returns, ret_mask = _pad_list_to_tensor(returns_list, 0.0, self.device)
+
+        resp_mask_padded, _ = _pad_list_to_tensor(batch["response_masks"], 0.0, self.device)
+        n_valid = resp_mask_padded.sum().clamp(min=1e-8)
+
+        new_log_probs = self.actor_ref.get_actor_log_probs(full_ids, full_attn, full_resp_mask)
+        batch_size = full_ids.size(0)
+        new_log_probs_resp = T.zeros_like(old_log_probs, device=self.device)
+        for i in range(batch_size):
+            s, rlen = qlens[i], resp_lens[i]
+            new_log_probs_resp[i, :rlen] = new_log_probs[i, s:s + rlen]
+
+        values = self.critic(full_ids, full_attn)
+        values_resp = T.zeros_like(returns, device=self.device)
+        for i in range(batch_size):
+            s, rlen = qlens[i], resp_lens[i]
+            values_resp[i, :rlen] = values[i, s:s + rlen]
+
+        ratio = T.exp(new_log_probs_resp - old_log_probs)
+        surr1 = ratio * advantages
+        surr2 = T.clamp(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range) * advantages
+        policy_loss = -(T.minimum(surr1, surr2) * adv_mask).sum() / n_valid
+        value_loss = ((values_resp - returns) ** 2 * ret_mask).sum() / n_valid
+        kl_loss = ((old_log_probs - ref_log_probs) * adv_mask).sum() / n_valid
+        total_loss = policy_loss + 0.5 * value_loss + self.kl_coef * kl_loss
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        T.nn.utils.clip_grad_norm_(self.actor_ref.parameters_for_optimizer(), 1.0)
+        self.optimizer.step()
+
+        return {"policy_loss": policy_loss.item(), "value_loss": value_loss.item(), "kl_loss": kl_loss.item(), "total_loss": total_loss.item()}
 
     def train_step(self) -> dict:
-        """
-        一次完整训练步：1）用当前 buffer 数据 get()；2）多 epoch 内多次 sample(mini_batch_size) 调用 ppo_step。
-        返回汇总的 stats（可平均各 mini_batch 的 loss / kl）。
-        """
-        raise NotImplementedError
+        if len(self.memory) == 0:
+            return {}
+        data = self.memory.get(compute_gae=True)
+        all_stats = []
+        for _ in range(self.ppo_epochs):
+            mini = self.memory.sample(mini_batch_size=self.mini_batch_size, compute_gae=False)
+            mini["advantages"] = [data["advantages"][i] for i in [data["queries"].index(q) for q in mini["queries"]]]
+            mini["returns"] = [data["returns"][i] for i in [data["queries"].index(q) for q in mini["queries"]]]
+            # Sample indices from data
+            indices = list(range(len(data["queries"])))
+            if self.mini_batch_size and self.mini_batch_size < len(indices):
+                import random
+                idx = random.sample(indices, self.mini_batch_size)
+            else:
+                idx = indices
+            mini = {k: [v[i] for i in idx] if isinstance(v, list) else v for k, v in data.items()}
+            stats = self.ppo_step(mini)
+            all_stats.append(stats)
+        return _aggregate_stats(all_stats) if all_stats else {}
 
-    def run(self, dataloader, total_steps: int) -> None:
-        """
-        主循环：每一步 collect_rollouts 攒一 buffer → train_step 更新 → memory.clear()；
-        共执行 total_steps 步（或按 dataloader 轮数）。
-        """
-        raise NotImplementedError("for step in range(total_steps): collect_rollouts → train_step → memory.clear()")
+    def run(self, dataloader, total_steps: int, max_prompt_length: int = 1024) -> None:
+        for step in range(total_steps):
+            self.collect_rollouts(dataloader, max_prompt_length=max_prompt_length, batches_per_rollout=1)
+            if len(self.memory) > 0:
+                self.train_step()
+            self.memory.clear()
 
 
 def _aggregate_stats(stats_list: list) -> dict:
-    """把多个 ppo_step 返回的 stats 求平均。"""
+    """Average stats from multiple ppo_step calls."""
     if not stats_list:
         return {}
     keys = stats_list[0].keys()
@@ -523,17 +701,12 @@ def _pad_list_to_tensor(
     device: T.device,
     max_len: Optional[int] = None,
 ) -> Tuple[T.Tensor, T.Tensor]:
-    """
-    把 list of 1d tensor  pad 成 (batch, max_len)，并返回有效位置 mask (1=有效)。
-    返回: (stacked, mask), 均为 (batch, max_len)。
-    """
+    """Pad list of 1d tensors to (batch, max_len), return valid mask (1=valid)."""
     if max_len is None:
         max_len = max(t.size(0) for t in tensors)
     batch = len(tensors)
     dtype = tensors[0].dtype
-    stacked = T.full(
-        (batch, max_len), pad_value, dtype=dtype, device=device,
-    )
+    stacked = T.full((batch, max_len), pad_value, dtype=dtype, device=device)
     mask = T.zeros(batch, max_len, dtype=T.float32, device=device)
     for i, t in enumerate(tensors):
         L = t.size(0)
