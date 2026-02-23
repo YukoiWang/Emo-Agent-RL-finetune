@@ -1,3 +1,6 @@
+import glob
+import os
+import shutil
 from typing import Dict, Any, Callable, List, Optional
 
 import torch
@@ -18,6 +21,7 @@ def build_ppo_config(cfg: Dict[str, Any]) -> PPOConfig:
         cliprange=cfg.get("clip_range", 0.2),
         cliprange_value=cfg.get("clip_range_value", 0.2),
         init_kl_coef=cfg.get("kl_penalty_coef", 0.02),
+        gradient_checkpointing=cfg.get("gradient_checkpointing", False),
     )
 
 
@@ -54,6 +58,11 @@ def run_ppo_training(cfg: Dict[str, Any], reward_fn: Optional[Callable[[List[str
     model_cfg = cfg["model"]
     data_cfg = cfg["data"]
     rl_cfg = cfg["rl"]["ppo"]
+    training_cfg = cfg.get("training", {})
+    output_dir = training_cfg.get("output_dir", "outputs/rl")
+    total_steps = training_cfg.get("total_steps", 0)  # 0 = 跑完整个 dataset
+    save_steps = training_cfg.get("save_steps", 500)
+    save_total_limit = training_cfg.get("save_total_limit", 3)
 
     if reward_fn is None:
         reward_cfg = cfg.get("reward", {}) or {}
@@ -85,6 +94,11 @@ def run_ppo_training(cfg: Dict[str, Any], reward_fn: Optional[Callable[[List[str
         use_lora=model_cfg.get("use_lora", True),
         lora_config=lora_cfg,
     )
+
+    # gradient checkpointing 在 wrap 之前启用，减少显存
+    if rl_cfg.get("gradient_checkpointing", False):
+        if hasattr(mt.model, "gradient_checkpointing_enable"):
+            mt.model.gradient_checkpointing_enable()
 
     # 转为带 value head 的模型
     model = AutoModelForCausalLMWithValueHead.from_pretrained(mt.model)
@@ -131,13 +145,58 @@ def run_ppo_training(cfg: Dict[str, Any], reward_fn: Optional[Callable[[List[str
     )
 
     # 5. 训练循环
+    os.makedirs(output_dir, exist_ok=True)
+    global_step = 0
+
+    # PPO 生成时必须 do_sample=True，否则默认贪婪解码会导致 KL 散度为负、训练失败
+    max_new_tokens = data_cfg.get("max_response_length", 256)
+    generation_kwargs = {
+        "do_sample": True,  # 采样生成，允许探索
+        "top_p": 1.0,       # nucleus sampling（1.0 即不截断）
+        "temperature": 1.0, # 控制随机性
+        "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
+        "max_new_tokens": max_new_tokens,
+    }
+
+    def _save_checkpoint():
+        """保存 Actor（pretrained_model，含 LoRA），推理时只需这部分。"""
+        ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
+        model.pretrained_model.save_pretrained(ckpt_dir)
+        tokenizer.save_pretrained(ckpt_dir)
+        print(f"  [saved] {ckpt_dir}")
+
+    def _prune_checkpoints():
+        if save_total_limit <= 0:
+            return
+        pattern = os.path.join(output_dir, "checkpoint-*")
+        ckpts = sorted(glob.glob(pattern), key=lambda p: int(p.split("-")[-1]))
+        while len(ckpts) > save_total_limit:
+            old = ckpts.pop(0)
+            shutil.rmtree(old, ignore_errors=True)
+            print(f"  [pruned] {old}")
+
     for batch in ppo_trainer.dataloader:
-        queries = batch["input_ids"]
-        responses = ppo_trainer.generate(
-            queries,
-            max_new_tokens=data_cfg.get("max_response_length", 512),
-        )
-        texts = mt.tokenizer.batch_decode(responses, skip_special_tokens=True)
-        rewards = torch.tensor(reward_fn(texts), dtype=torch.float32).to(model.device)
-        stats = ppo_trainer.step(queries, responses, rewards)
-        ppo_trainer.log_stats(stats, batch, rewards)
+        if total_steps and global_step >= total_steps:
+            break
+
+        query_tensors = [torch.tensor(ids).to(model.pretrained_model.device) for ids in batch["input_ids"]]
+        responses = ppo_trainer.generate(query_tensors, **generation_kwargs)
+        response_tensors = [r.squeeze() for r in responses]
+        texts = mt.tokenizer.batch_decode(response_tensors, skip_special_tokens=True)
+        reward_values = reward_fn(texts)
+        reward_tensors = [torch.tensor(r, dtype=torch.float32).to(model.pretrained_model.device) for r in reward_values]
+        stats = ppo_trainer.step(query_tensors, response_tensors, reward_tensors)
+        ppo_trainer.log_stats(stats, batch, reward_tensors)
+
+        global_step += 1
+
+        # 定期保存 checkpoint
+        if save_steps and global_step % save_steps == 0:
+            _save_checkpoint()
+            _prune_checkpoints()
+
+    # 训练结束，保存最终模型
+    final_dir = os.path.join(output_dir, "final")
+    model.pretrained_model.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
+    print(f"[PPO] 训练完成，模型已保存到 {final_dir}")

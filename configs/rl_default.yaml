@@ -1,8 +1,7 @@
 seed: 42
 
 model:
-  # 这里一般加载 SFT 之后的模型权重
-  sft_model_path: "outputs/sft"
+  sft_model_path: "Qwen/Qwen2.5-1.5B-Instruct"
   dtype: "bfloat16"
   use_lora: true
 
@@ -10,18 +9,19 @@ data:
   # RL 训练用的数据，可以是：
   # - 带有评分的咨询对话
   # - 或者偏好数据（better / worse 回复）
-  train_file: "data/rl/train.jsonl"
-  max_prompt_length: 1024
-  max_response_length: 512
+  train_file: "data/data/train_profile.jsonl"
+  max_prompt_length: 512   # 降低以省显存（原1024）
+  max_response_length: 256 # 降低以省显存（原512）
   num_proc: 4
 
 rl:
   algo: "ppo"  # 或 "dpo" / "kto" 等
 
-  # PPO 相关参数
+  # PPO 相关参数（16G 显存需 batch_size=2, mini_batch_size=1）
   ppo:
-    batch_size: 64
-    mini_batch_size: 8
+    batch_size: 2
+    mini_batch_size: 1
+    gradient_checkpointing: true
     ppo_epochs: 4
     learning_rate: 1.0e-6
     gamma: 1.0

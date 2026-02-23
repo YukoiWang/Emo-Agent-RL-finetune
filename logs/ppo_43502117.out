@@ -1,0 +1,6 @@
+=== Job started at Sun Feb 22 15:07:38 EST 2026 ===
+Node: gl1000.arc-ts.umich.edu
+GPU: Tesla V100-PCIE-16GB, 16384 MiB
+Python: Python 3.10.19
+================================
+=== Job finished at Sun Feb 22 15:10:13 EST 2026 ===

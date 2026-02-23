@@ -1,0 +1,7 @@
+=== Job started at Sun Feb 22 17:00:11 EST 2026 ===
+Node: gl1000.arc-ts.umich.edu
+GPU: Tesla V100-PCIE-16GB, 16384 MiB
+Python: Python 3.10.19
+================================
+[PPO] 训练完成，模型已保存到 outputs/rl/final
+=== Job finished at Sun Feb 22 19:28:52 EST 2026 ===

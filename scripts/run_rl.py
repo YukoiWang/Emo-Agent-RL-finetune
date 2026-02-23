@@ -47,8 +47,11 @@ def main() -> None:
     elif algo == "grpo":
         from src.training.grpo_training import run_grpo_training
         run_grpo_training(cfg)
+    elif algo == "dpo":
+        from src.training.dpo_trainer import run_dpo_training
+        run_dpo_training(cfg)
     else:
-        raise ValueError(f"不支持的 RL 算法: {algo}，当前支持 ppo, grpo")
+        raise ValueError(f"不支持的 RL 算法: {algo}，当前支持 ppo, grpo, dpo")
 
 
 if __name__ == "__main__":

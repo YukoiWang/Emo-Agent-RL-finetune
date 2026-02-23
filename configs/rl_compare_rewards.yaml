@@ -1,0 +1,47 @@
+# 小规模实验：比较 mode1 / mode2 / mode3 三种 reward 效果
+# 用法：python scripts/run_reward_comparison.py --config configs/rl_compare_rewards.yaml
+seed: 42
+
+model:
+  sft_model_path: "Qwen/Qwen2.5-1.5B-Instruct"
+  dtype: "bfloat16"
+  use_lora: true
+
+data:
+  train_file: "data/data/train_profile.jsonl"
+  max_prompt_length: 512
+  max_response_length: 256
+  num_proc: 4
+
+rl:
+  algo: "ppo"
+  ppo:
+    batch_size: 2
+    mini_batch_size: 1
+    gradient_checkpointing: true
+    ppo_epochs: 4
+    learning_rate: 1.0e-6
+    gamma: 1.0
+    lam: 0.95
+    clip_range: 0.2
+    kl_penalty_coef: 0.02
+
+reward:
+  type: "emo"
+  # reward_mode 由脚本按 mode1/mode2/mode3 依次覆盖
+  reward_mode: "mode1"
+  w1: 1.0
+  w2: 0.3
+  w3: 0.2
+  trend_n: 5
+  S1: 100
+  S2: 300
+  warmup_steps: 200
+  # emo_adapter_path: null  # 可选，使用情感分类器更准确
+
+training:
+  output_dir: "outputs/rl_compare"
+  total_steps: 150   # 小规模：约 150 个 batch
+  logging_steps: 25
+  save_steps: 100
+  save_total_limit: 2

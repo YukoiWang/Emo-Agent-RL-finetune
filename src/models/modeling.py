@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import torch
 from peft import LoraConfig, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
@@ -67,10 +68,11 @@ def load_sft_model(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    torch_dtype = torch.bfloat16 if dtype == "bfloat16" else (torch.float16 if dtype == "float16" else "auto")
     model = AutoModelForCausalLM.from_pretrained(
         sft_model_path,
-        torch_dtype="auto" if dtype in ("bfloat16", "float16", "auto") else "auto",
-        device_map="auto",
+        torch_dtype=torch_dtype,
+        device_map={"": 0} if torch.cuda.is_available() else "auto",
     )
 
     if use_lora:
