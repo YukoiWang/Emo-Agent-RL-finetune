@@ -1,0 +1,53 @@
+# On-policy DPO 训练：train_profile 模拟用户，每轮 k 个回复 → 情感打分选 best/worst → DPO
+# 用法：python scripts/run_dpo_emo.py --config configs/rl_dpo_emo.yaml
+seed: 42
+
+model:
+  sft_model_path: "Qwen/Qwen2.5-1.5B-Instruct"
+  dtype: "bfloat16"
+  use_lora: true
+
+data:
+  train_file: "data/data/train_profile.jsonl"
+  max_prompt_length: 512
+  max_response_length: 256
+
+reward:
+  type: "emo"
+  reward_mode: "mode1"
+  w1: 1.0
+  w2: 0.3
+  w3: 0.2
+  trend_n: 5
+  # emo_adapter_path: null  # 可选，情感分类器路径
+
+rollout:
+  num_profiles: 20       # 参与 rollout 的 profile 数量
+  batch_size: 4          # 每批 rollout 的 profile 数
+  num_samples: 4         # 每轮生成的回复数 k
+  max_turns: 8           # 每段对话最大轮数
+  temperature: 0.8
+  top_p: 1.0
+  use_planning_emo: true # 用 PlayerSimulatorWithPlanning（需 API key）
+  use_planning_score: true  # 用 emo_planning 打分（考虑 profile、上下文、隐藏主题）；false 则用 reward_emo
+  use_mock_simulator: false  # true 时用简单 mock，无需 API，便于本地测试
+  sft_model_path: null   # planning 用本地 SFT 时指定（打分和用户模拟器共用）
+  target: "eq"
+  user_model: "deepseek-chat"  # 用户模拟器调用的 API 模型
+  planning_model: "deepseek-chat"  # planning 打分用 API 时的模型（sft_model_path 为空时）
+
+rl:
+  algo: "dpo_emo"
+  dpo:
+    beta: 0.1
+    learning_rate: 2.0e-6
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 8
+
+training:
+  output_dir: "outputs/dpo_emo"
+  num_train_epochs: 1
+  max_steps: -1
+  save_steps: 500
+  logging_steps: 50
+  save_total_limit: 3

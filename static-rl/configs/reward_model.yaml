@@ -1,0 +1,22 @@
+# Reward Model 训练配置 (LoRA) - EmpatheticDialogues 偏好对
+# 用法: python static-rl/run_reward_model.py --config static-rl/configs/reward_model.yaml
+
+reward_model:
+  base_model: "Qwen/Qwen2.5-0.5B-Instruct"
+  dtype: "bfloat16"
+  use_lora: true   # false 时全量微调，见 reward_model_full.yaml
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-5   # LoRA 通常 1e-5；全量建议 1e-6~5e-6
+
+data:
+  train_file: "static-rl/data/empathetic_preference.jsonl"
+
+training:
+  output_dir: "static-rl/outputs/reward_model"
+  num_train_epochs: 1
+  logging_steps: 50
+  save_steps: 500

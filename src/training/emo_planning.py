@@ -212,6 +212,41 @@ def planning_reply(
     return out, planning
 
 
+def score_responses_with_planning(
+    responses: list,
+    profile: dict,
+    dialog: list,
+    emo_point: float,
+    llm_fn: Callable[[List[Dict[str, str]]], str],
+    target_prompt: str = "eq",
+) -> List[float]:
+    """
+    用 planning_reply 对多个 NPC 回复分别打分（考虑 profile、对话上下文、隐藏主题）。
+    对每个 response，构造 history = dialog + [assistant: response]，调用 planning 得到新 emo_point。
+    返回: [new_emo_1, new_emo_2, ...]，即每个回复导致的情绪分（0-100）。
+    """
+    scores: List[float] = []
+    for resp in responses:
+        history = list(dialog) + [{"role": "assistant", "content": (resp or "").strip() or "…"}]
+        if len(history) < 2:
+            scores.append(50.0)
+            continue
+        player_data = {
+            "player": profile.get("player", ""),
+            "scene": profile.get("scene", ""),
+            "task": profile.get("task", ""),
+            "history": history,
+            "emo_point": emo_point,
+            "target": profile.get("target", target_prompt),
+        }
+        try:
+            updated, _ = planning_reply(player_data, llm_fn, target_prompt=target_prompt)
+            scores.append(float(updated.get("emo_point", 50.0)))
+        except Exception:
+            scores.append(50.0)
+    return scores
+
+
 def build_planning_emo_analyzer_fn(
     llm_fn: Callable[[List[Dict[str, str]]], str],
     target_prompt: str = "eq",

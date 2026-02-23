@@ -21,6 +21,7 @@ env/
 # data/counseling_dialogue/
 # weibo*.jsonl
 # combined_*.jsonl
+logs/
 
 # IDE
 .idea/

@@ -328,3 +328,21 @@ Caching is incompatible with gradient checkpointing in Qwen2DecoderLayer. Settin
   warnings.warn(
 /home/yukiwang/.conda/envs/emo/lib/python3.10/site-packages/trl/trainer/ppo_trainer.py:1313: UserWarning: KL divergence is starting to become negative: -128.78 - this might be a precursor for failed training. sometimes this happens because the generation kwargs are not correctly set. Please make sure that the generation kwargs are set correctly, or review your training hyperparameters.
   warnings.warn(
+/home/yukiwang/.conda/envs/emo/lib/python3.10/site-packages/trl/trainer/ppo_trainer.py:1313: UserWarning: KL divergence is starting to become negative: -131.17 - this might be a precursor for failed training. sometimes this happens because the generation kwargs are not correctly set. Please make sure that the generation kwargs are set correctly, or review your training hyperparameters.
+  warnings.warn(
+/home/yukiwang/.conda/envs/emo/lib/python3.10/site-packages/trl/trainer/ppo_trainer.py:1313: UserWarning: KL divergence is starting to become negative: -109.06 - this might be a precursor for failed training. sometimes this happens because the generation kwargs are not correctly set. Please make sure that the generation kwargs are set correctly, or review your training hyperparameters.
+  warnings.warn(
+/home/yukiwang/.conda/envs/emo/lib/python3.10/site-packages/trl/trainer/ppo_trainer.py:1313: UserWarning: KL divergence is starting to become negative: -37.69 - this might be a precursor for failed training. sometimes this happens because the generation kwargs are not correctly set. Please make sure that the generation kwargs are set correctly, or review your training hyperparameters.
+  warnings.warn(
+/home/yukiwang/.conda/envs/emo/lib/python3.10/site-packages/trl/trainer/ppo_trainer.py:1313: UserWarning: KL divergence is starting to become negative: -124.90 - this might be a precursor for failed training. sometimes this happens because the generation kwargs are not correctly set. Please make sure that the generation kwargs are set correctly, or review your training hyperparameters.
+  warnings.warn(
+/home/yukiwang/.conda/envs/emo/lib/python3.10/site-packages/trl/trainer/ppo_trainer.py:1313: UserWarning: KL divergence is starting to become negative: -71.70 - this might be a precursor for failed training. sometimes this happens because the generation kwargs are not correctly set. Please make sure that the generation kwargs are set correctly, or review your training hyperparameters.
+  warnings.warn(
+/home/yukiwang/.conda/envs/emo/lib/python3.10/site-packages/trl/trainer/ppo_trainer.py:1313: UserWarning: KL divergence is starting to become negative: -89.59 - this might be a precursor for failed training. sometimes this happens because the generation kwargs are not correctly set. Please make sure that the generation kwargs are set correctly, or review your training hyperparameters.
+  warnings.warn(
+/home/yukiwang/.conda/envs/emo/lib/python3.10/site-packages/trl/trainer/ppo_trainer.py:1313: UserWarning: KL divergence is starting to become negative: -129.37 - this might be a precursor for failed training. sometimes this happens because the generation kwargs are not correctly set. Please make sure that the generation kwargs are set correctly, or review your training hyperparameters.
+  warnings.warn(
+/home/yukiwang/.conda/envs/emo/lib/python3.10/site-packages/trl/trainer/ppo_trainer.py:1313: UserWarning: KL divergence is starting to become negative: -75.96 - this might be a precursor for failed training. sometimes this happens because the generation kwargs are not correctly set. Please make sure that the generation kwargs are set correctly, or review your training hyperparameters.
+  warnings.warn(
+/home/yukiwang/.conda/envs/emo/lib/python3.10/site-packages/trl/trainer/ppo_trainer.py:1313: UserWarning: KL divergence is starting to become negative: -130.11 - this might be a precursor for failed training. sometimes this happens because the generation kwargs are not correctly set. Please make sure that the generation kwargs are set correctly, or review your training hyperparameters.
+  warnings.warn(

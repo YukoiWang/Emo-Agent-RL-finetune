@@ -1,0 +1,39 @@
+# PPO 训练配置 (LoRA) - EmpatheticDialogues prompt + Reward Model
+# 用法: python static-rl/run_ppo.py --config static-rl/configs/ppo.yaml
+# 前置: 1. build_empathetic_preference_dataset.py  2. run_reward_model.py
+
+seed: 42
+
+model:
+  base_model: "Qwen/Qwen2.5-1.5B-Instruct"
+  sft_model_path: "outputs/sft_empathetic/final"
+  dtype: "bfloat16"
+  use_lora: true   # false 时全量微调，见 ppo_full.yaml
+
+data:
+  # 使用偏好数据的 user 作为 prompt
+  train_file: "static-rl/data/empathetic_preference.jsonl"
+  max_prompt_length: 512
+  max_response_length: 256
+  num_proc: 4
+
+reward:
+  reward_model_path: "static-rl/outputs/reward_model"
+
+rl:
+  ppo:
+    batch_size: 8
+    mini_batch_size: 2
+    gradient_checkpointing: true
+    ppo_epochs: 4
+    learning_rate: 1.0e-6
+    gamma: 1.0
+    lam: 0.95
+    clip_range: 0.2
+    kl_penalty_coef: 0.02
+
+training:
+  output_dir: "static-rl/outputs/ppo"
+  total_steps: 5000
+  save_steps: 500
+  save_total_limit: 3

@@ -1,0 +1,38 @@
+# On-policy DPO 快速测试（mock 用户模拟器，无需 API）
+# 用法：python scripts/run_rl.py --config configs/rl_dpo_emo_mock.yaml
+seed: 42
+
+model:
+  sft_model_path: "Qwen/Qwen2.5-1.5B-Instruct"
+  dtype: "bfloat16"
+  use_lora: true
+
+data:
+  train_file: "data/data/train_profile.jsonl"
+  max_response_length: 128
+
+reward:
+  type: "emo"
+  reward_mode: "mode1"
+
+rollout:
+  num_profiles: 4
+  batch_size: 2
+  num_samples: 3
+  max_turns: 3
+  use_mock_simulator: true
+
+rl:
+  algo: "dpo_emo"
+  dpo:
+    beta: 0.1
+    learning_rate: 2.0e-6
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 2
+
+training:
+  output_dir: "outputs/dpo_emo_mock"
+  num_train_epochs: 1
+  max_steps: 20
+  save_steps: 100
+  logging_steps: 5
