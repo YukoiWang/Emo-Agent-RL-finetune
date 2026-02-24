@@ -64,7 +64,7 @@ def run_dpo_training(cfg: Dict[str, Any]) -> None:
         if col not in dataset.column_names:
             raise ValueError(
                 f"DPO 数据集需要 '{col}' 列。当前列: {dataset.column_names}。"
-                "请确保使用 scripts/convert_ipm_prefdial.py 转换 IPM-PrefDial 数据。"
+                "请提供 (prompt/user, chosen, rejected) 格式的偏好对 jsonl。"
             )
 
     # 3. DPO 配置

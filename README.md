@@ -41,31 +41,15 @@ python scripts/run_rl.py \
   --config configs/rl_default.yaml
 ```
 
-### 使用 IPM-PrefDial 进行 DPO 训练
+### DPO 训练
 
-[IPM-PrefDial](https://github.com/Zc0812/DecoupledESC) 是情感支持对话（ESC）的偏好对数据集，来自 DecoupledESC 论文。
-
-**步骤：**
-
-1. 转换数据为 DPO 格式（从网络自动下载）：
+- **On-policy DPO**（profile 多轮对话，每轮生成 k 个回复、打分选 best/worst 构造偏好对）：
 
 ```bash
-python scripts/convert_ipm_prefdial.py -o data/ipm_prefdial_dpo.jsonl
+python scripts/run_dpo_emo.py --config configs/rl_dpo_emo.yaml
+# 或
+python scripts/run_rl.py --config configs/rl_dpo_emo.yaml
 ```
 
-2. 运行 DPO 训练：
-
-```bash
-python scripts/run_rl.py --config configs/rl_dpo.yaml
-```
-
-可选：指定本地 JSON 或使用 tokenizer 的 chat template：
-
-```bash
-# 使用本地文件
-python scripts/convert_ipm_prefdial.py -i /path/to/ESC_Qwen_RG_dpo.json -o data/ipm_prefdial_dpo.jsonl
-
-# 使用 Qwen chat template 格式化 prompt
-python scripts/convert_ipm_prefdial.py -o data/ipm_prefdial_dpo.jsonl --model Qwen/Qwen2.5-1.5B-Instruct
-```
+- **离线 DPO**（已有偏好对数据）：可使用 `static-rl/run_dpo.py`，配合 EmpatheticDialogues 偏好数据（见 static-rl 目录说明）。
 

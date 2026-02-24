@@ -116,7 +116,7 @@ def run_offline_comparison(emo_adapter_path: Optional[str] = None) -> None:
 def run_quick_ppo_comparison(config_path: str) -> None:
     """各跑 20 步 PPO，对比三种 reward 的 loss/reward 曲线。"""
     import yaml
-    from src.training.rl_trainer import run_ppo_training
+    from src.training.ppo_emo_trainer import run_ppo_emo_training
 
     with Path(config_path).open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -131,7 +131,7 @@ def run_quick_ppo_comparison(config_path: str) -> None:
         out = cfg["training"].get("output_dir", "outputs/rl")
         cfg["training"]["output_dir"] = f"{out}_compare_{mode}"
         print(f"\n{'='*60}\n>>> 运行 PPO reward_mode={mode}, total_steps=20\n{'='*60}")
-        run_ppo_training(cfg)
+        run_ppo_emo_training(cfg)
     print("\n完成。查看各 output 目录下的 trainer_state.json 或日志对比 loss/reward。")
 
 

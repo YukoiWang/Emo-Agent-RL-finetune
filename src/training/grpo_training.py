@@ -13,6 +13,7 @@ GRPO (Group Relative Policy Optimization) 训练模块。
 from __future__ import annotations
 
 import copy
+import json
 import os
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -170,6 +171,8 @@ def run_grpo_training(
     # -- Training loop --
     print(f"[GRPO] 开始训练: total_steps={total_steps}, G={num_generations}, lr={lr}, eps={epsilon}")
     os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, "training_log.jsonl")
+    log_file = open(log_path, "w", encoding="utf-8")
     data_iter = iter(dataloader)
     global_step = 0
     total_loss_acc = 0.0
@@ -248,6 +251,15 @@ def run_grpo_training(
             optimizer.step()
             total_loss_acc += loss.item()
             total_reward_acc += r_mean.item()
+            kl_avg = (kl_loss / valid_count).item()
+            log_record = {
+                "step": global_step,
+                "reward_mean": r_mean.item(),
+                "loss": loss.item(),
+                "kl_loss": kl_avg,
+            }
+            log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+            log_file.flush()
 
         global_step += 1
 
@@ -266,8 +278,9 @@ def run_grpo_training(
             tokenizer.save_pretrained(ckpt_dir)
             print(f"  [saved] {ckpt_dir}")
 
+    log_file.close()
     # 最终保存
     final_dir = os.path.join(output_dir, "final")
     actor.save_pretrained(final_dir)
     tokenizer.save_pretrained(final_dir)
-    print(f"[GRPO] 训练完成，模型已保存到 {final_dir}")
+    print(f"[GRPO] 训练完成，模型已保存到 {final_dir}，指标日志: {log_path}")

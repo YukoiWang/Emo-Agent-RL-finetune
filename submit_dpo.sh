@@ -1,22 +1,26 @@
 #!/bin/bash
-#SBATCH --job-name=emo-sft
+#SBATCH --job-name=emo-dpo
 #SBATCH --partition=gpu
 #SBATCH -N 1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=08:00:00
-#SBATCH --output=logs/sft_%j.out
-#SBATCH --error=logs/sft_%j.err
+#SBATCH --output=logs/dpo_%j.out
+#SBATCH --error=logs/dpo_%j.err
 
-# 不依赖 module，直接使用 conda
-# 若 conda 路径不同，请修改 CONDA_PATH（常见: ~/miniconda3 或 ~/anaconda3）
+# 环境：优先 conda，无则用项目 .venv
 CONDA_PATH="${HOME}/miniconda3"
 if [[ ! -f "${CONDA_PATH}/etc/profile.d/conda.sh" ]]; then
     CONDA_PATH="${HOME}/anaconda3"
 fi
-source "${CONDA_PATH}/etc/profile.d/conda.sh"
-conda activate emo
+if [[ -f "${CONDA_PATH}/etc/profile.d/conda.sh" ]]; then
+    source "${CONDA_PATH}/etc/profile.d/conda.sh"
+    conda activate emo
+else
+    # 使用项目 venv
+    source /home/yukiwang/Emo-Agent-RL-finetune/.venv/bin/activate
+fi
 
 export PYTHONNOUSERSITE=1
 export WANDB_MODE=disabled
@@ -34,6 +38,14 @@ echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/d
 echo "Python: $(python --version)"
 echo "================================"
 
-python scripts/run_sft_empathetic.py --config configs/sft_empathetic.yaml
+# 1. 若无偏好数据则先构建（使用本地 data/empathetic_dialogues/train.jsonl）
+PREF_FILE="static-rl/data/empathetic_preference.jsonl"
+if [[ ! -f "$PREF_FILE" ]]; then
+    echo "Building preference dataset from local train.jsonl..."
+    python static-rl/build_empathetic_preference_dataset.py --output "$PREF_FILE"
+fi
+
+# 2. 运行 DPO 训练（LoRA 默认；全量用 static-rl/configs/dpo_full.yaml）
+python static-rl/run_dpo.py --config static-rl/configs/dpo.yaml
 
 echo "=== Job finished at $(date) ==="

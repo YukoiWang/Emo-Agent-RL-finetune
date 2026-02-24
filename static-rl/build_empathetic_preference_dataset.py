@@ -21,10 +21,9 @@ Plutchik 情绪轮四组对立关系：
 import argparse
 import json
 import random
+import re
 from pathlib import Path
 from collections import defaultdict
-
-from datasets import load_dataset
 
 
 # EmpatheticDialogues 32 情绪 -> Plutchik 8 类映射
@@ -79,6 +78,36 @@ ED_TO_PLUTCHIK = {
 }
 
 
+# 从 system 字符串提取情绪标签，例如 "expressing sentimental emotions" -> "sentimental"
+_EMOTION_FROM_SYSTEM = re.compile(r"expressing\s+(\w+)\s+emotions?", re.I)
+
+
+def _load_local_empathetic_jsonl(path: str) -> list[dict]:
+    """从本地 jsonl（user/assistant/system）加载，返回与 HF 格式兼容的列表：prompt, utterance, context。"""
+    out = []
+    path = Path(path)
+    if not path.exists():
+        return out
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            user = (obj.get("user") or "").strip()
+            assistant = (obj.get("assistant") or "").strip()
+            system = (obj.get("system") or "").strip()
+            if not user or not assistant:
+                continue
+            match = _EMOTION_FROM_SYSTEM.search(system)
+            context = match.group(1).lower() if match else "neutral"
+            out.append({"prompt": user, "utterance": assistant, "context": context})
+    return out
+
+
 def _normalize_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
@@ -104,12 +133,36 @@ def build_preference_dataset(
     max_samples: int = 0,
     seed: int = 42,
     include_system: bool = True,
+    local_data_path: str | None = None,
 ) -> None:
     random.seed(seed)
 
-    print("Loading facebook/empathetic_dialogues...")
-    ds = load_dataset("facebook/empathetic_dialogues")
-    train = ds["train"]
+    # 优先使用本地 jsonl（避免 HF dataset 脚本已废弃导致的加载失败）
+    repo_root = Path(__file__).resolve().parent.parent
+    default_local = repo_root / "data" / "empathetic_dialogues" / "train.jsonl"
+    train: list[dict] = []
+
+    if local_data_path or default_local.exists():
+        path = Path(local_data_path) if local_data_path else default_local
+        if not path.is_absolute():
+            path = repo_root / path
+        print(f"Loading from local data: {path}")
+        train = _load_local_empathetic_jsonl(str(path))
+        if not train:
+            raise FileNotFoundError(f"No valid records in {path}")
+    else:
+        try:
+            from datasets import load_dataset
+            print("Loading facebook/empathetic_dialogues from Hugging Face...")
+            ds = load_dataset("facebook/empathetic_dialogues")
+            train = list(ds["train"])
+        except RuntimeError as e:
+            if "no longer supported" in str(e) or "Dataset scripts" in str(e):
+                raise FileNotFoundError(
+                    "Hugging Face no longer supports this dataset script. "
+                    f"Please use local data: put train.jsonl at {default_local} or pass --local-data <path>"
+                ) from e
+            raise
 
     # 按情绪构建 utterance 索引：emotion -> [utterance1, utterance2, ...]
     emotion_to_utterances = defaultdict(list)
@@ -211,6 +264,12 @@ def main():
         action="store_true",
         help="Do not include system prompt with emotion",
     )
+    parser.add_argument(
+        "--local-data",
+        type=str,
+        default=None,
+        help="Path to local train.jsonl (user/assistant/system). Default: data/empathetic_dialogues/train.jsonl",
+    )
     args = parser.parse_args()
 
     build_preference_dataset(
@@ -218,6 +277,7 @@ def main():
         max_samples=args.max_samples,
         seed=args.seed,
         include_system=not args.no_system,
+        local_data_path=args.local_data,
     )
 
 

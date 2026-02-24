@@ -18,7 +18,7 @@ if not _cache and os.path.exists("/tmp"):
 
 import yaml
 
-from src.training.rl_trainer import run_ppo_training
+from src.training.ppo_emo_trainer import run_ppo_emo_training
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,18 +43,15 @@ def main() -> None:
 
     algo = cfg.get("rl", {}).get("algo", "ppo")
     if algo == "ppo":
-        run_ppo_training(cfg)
+        run_ppo_emo_training(cfg)
     elif algo == "grpo":
         from src.training.grpo_training import run_grpo_training
         run_grpo_training(cfg)
-    elif algo == "dpo":
-        from src.training.dpo_trainer import run_dpo_training
-        run_dpo_training(cfg)
     elif algo == "dpo_emo":
         from src.training.dpo_emo_trainer import run_dpo_emo_training
         run_dpo_emo_training(cfg)
     else:
-        raise ValueError(f"不支持的 RL 算法: {algo}，当前支持 ppo, grpo, dpo, dpo_emo")
+        raise ValueError(f"不支持的 RL 算法: {algo}，当前支持 ppo, grpo, dpo_emo")
 
 
 if __name__ == "__main__":

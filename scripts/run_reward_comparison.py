@@ -28,7 +28,7 @@ if not _cache and os.path.exists("/tmp"):
 
 import yaml
 
-from src.training.rl_trainer import run_ppo_training
+from src.training.ppo_emo_trainer import run_ppo_emo_training
 
 
 def main() -> None:
@@ -69,7 +69,7 @@ def main() -> None:
         print(f"    total_steps={cfg['training'].get('total_steps', 'default')}")
         print("=" * 70)
 
-        run_ppo_training(cfg)
+        run_ppo_emo_training(cfg)
         results.append((mode, cfg["training"]["output_dir"]))
 
     print("\n" + "=" * 70)

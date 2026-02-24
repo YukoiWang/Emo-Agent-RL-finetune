@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-全模型评估脚本：对比 base、SFT-only（心理咨询）、SFT+RL(mode1/2/3)、以及 mode3 各 stage。
-评估维度：Sentient-Benchmark（情感/共情）、情绪改善指标、对话质量、综合能力（防遗忘）。
+全模型评估脚本（类 RLVERE 多维度评估）：对比 base、SFT、SFT+RL(mode1/2/3)、DPO、GRPO 等。
+评估维度：Sentient-Benchmark（情感/共情）、情绪改善指标、综合能力（防遗忘）。
+
+支持 quick_verify 输出目录：--quick-verify-dir outputs/quick_verify 会加入 ppo_mode1/2/3、dpo、grpo 的 final 路径。
 """
 from __future__ import annotations
 
@@ -9,11 +11,21 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+try:
+    from peft import PeftModel
+    _HAS_PEFT = True
+except ImportError:
+    PeftModel = None
+    _HAS_PEFT = False
 
 
 # ---------------------------------------------------------------------------
@@ -30,19 +42,37 @@ DEFAULT_MODEL_PATHS = {
     "sft_rl_mode3_stage3": "outputs/ppo_emo_mode3/final",
 }
 
+# quick_verify 子目录名 -> 显示名（路径由 --quick-verify-dir 决定，指向 {dir}/{sub}/final）
+QUICK_VERIFY_MODELS = ["ppo_mode1", "ppo_mode2", "ppo_mode3", "grpo"]
 
-def load_model_and_tokenizer(model_path: str, device: str = "cuda"):
-    """加载因果 LM 与 tokenizer。"""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+def load_model_and_tokenizer(model_path: str, device: str = "cuda", base_model_name: Optional[str] = None):
+    """加载因果 LM 与 tokenizer；若目录含 adapter_config.json 则按 LoRA 加载。"""
     path = model_path if os.path.isabs(model_path) else os.path.join(ROOT, model_path)
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"模型路径不存在: {path}")
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        path,
-        torch_dtype="auto",
-        device_map="auto" if device == "cuda" else None,
-    )
+    adapter_config = Path(path) / "adapter_config.json"
+    base_model_name = base_model_name or "Qwen/Qwen2.5-1.5B-Instruct"
+    if _HAS_PEFT and adapter_config.exists():
+        with open(adapter_config, "r") as f:
+            base_name = json.load(f).get("base_model_name_or_path") or base_model_name
+        base = AutoModelForCausalLM.from_pretrained(
+            base_name,
+            torch_dtype=getattr(torch, "bfloat16", torch.float32) if torch.cuda.is_available() else torch.float32,
+            device_map="auto" if device == "cuda" else None,
+            trust_remote_code=True,
+        )
+        model = PeftModel.from_pretrained(base, path)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            torch_dtype="auto",
+            device_map="auto" if device == "cuda" else None,
+            trust_remote_code=True,
+        )
     if device == "cpu":
         model = model.to("cpu")
     return model, tokenizer
@@ -202,9 +232,13 @@ def run_general_capability(
 def main():
     parser = argparse.ArgumentParser(description="全模型评估：base / SFT / SFT+RL(mode1/2/3) / mode3 各 stage")
     parser.add_argument("--models", type=str, nargs="+", default=None,
-                        help="要评估的模型名，如 base sft_only sft_rl_mode1 sft_rl_mode2 sft_rl_mode3 sft_rl_mode3_stage1 sft_rl_mode3_stage2 sft_rl_mode3_stage3")
+                        help="要评估的模型名，如 base sft_only sft_rl_mode1 或 ppo_mode1 ppo_mode2 grpo（配合 --quick-verify-dir）")
     parser.add_argument("--model_paths", type=str, default=None,
                         help="JSON 或 key=value 覆盖默认路径，如 '{\"base\":\"/path/to/base\"}'")
+    parser.add_argument("--quick-verify-dir", type=str, default=None,
+                        help="quick_verify 输出根目录；指定后自动加入 ppo_mode1/2/3、grpo 的 final 路径，可与 --models 联用")
+    parser.add_argument("--base-model", type=str, default=None,
+                        help="LoRA 的 base 模型名（仅当从 adapter 加载时备用）")
     parser.add_argument("--sentient_data", type=str, default=os.path.join(ROOT, "data/eval/sentient_benchmark.jsonl"))
     parser.add_argument("--profile_data", type=str, default=os.path.join(ROOT, "data/data/test_profile.jsonl"))
     parser.add_argument("--device", type=str, default="cuda")
@@ -214,6 +248,12 @@ def main():
 
     model_names = args.models or list(DEFAULT_MODEL_PATHS.keys())
     paths = dict(DEFAULT_MODEL_PATHS)
+    if args.quick_verify_dir:
+        qv_dir = args.quick_verify_dir if os.path.isabs(args.quick_verify_dir) else os.path.join(ROOT, args.quick_verify_dir)
+        for sub in QUICK_VERIFY_MODELS:
+            paths[sub] = os.path.join(qv_dir, sub, "final")
+        if not args.models:
+            model_names = list(QUICK_VERIFY_MODELS)
     if args.model_paths:
         if args.model_paths.strip().startswith("{"):
             paths.update(json.loads(args.model_paths))
@@ -238,7 +278,7 @@ def main():
             model, tokenizer = None, None
         else:
             try:
-                model, tokenizer = load_model_and_tokenizer(path, args.device)
+                model, tokenizer = load_model_and_tokenizer(path, args.device, args.base_model)
             except Exception as e:
                 print(f"  加载失败: {e}")
                 all_results[name] = {"error": str(e)}
