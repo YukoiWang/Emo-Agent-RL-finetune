@@ -4,9 +4,9 @@
 小规模实验：用 train_profile 作为模拟用户，分别用 mode1/mode2/mode3 三种 reward 进行 PPO 训练。
 
 用法：
-  python scripts/run_reward_comparison.py --config configs/rl_compare_rewards.yaml
-  python scripts/run_reward_comparison.py --config configs/rl_compare_rewards.yaml --steps 100
-  python scripts/run_reward_comparison.py --config configs/rl_compare_rewards.yaml --modes mode1 mode3  # 只跑指定模式
+  python scripts/rl/run_reward_comparison.py --config configs/rl_compare_rewards.yaml
+  python scripts/rl/run_reward_comparison.py --config configs/rl_compare_rewards.yaml --steps 100
+  python scripts/rl/run_reward_comparison.py --config configs/rl_compare_rewards.yaml --modes mode1 mode3  # 只跑指定模式
 """
 import argparse
 import copy
@@ -14,7 +14,7 @@ import os
 import sys
 from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 

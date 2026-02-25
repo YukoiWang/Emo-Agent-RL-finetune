@@ -1,5 +1,5 @@
 # On-policy DPO 训练：train_profile 模拟用户，每轮 k 个回复 → 情感打分选 best/worst → DPO
-# 用法：python scripts/run_dpo_emo.py --config configs/rl_dpo_emo.yaml
+# 用法：python scripts/rl/run_dpo_emo.py --config configs/rl_dpo_emo.yaml
 seed: 42
 
 model:

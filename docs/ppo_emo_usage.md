@@ -7,7 +7,7 @@
 - **情绪分析**：`emo_classifier_lora` 微调的情感分类模型分析用户回复的积极/消极/中性，并结合 NPC 与隐藏主题贴合程度得到 `change_value`，用于更新 `emo_point`。
 - **结束条件**：用户说「再见/拜拜」或 `emo_point <= 0` 时结束对话。
 - **Reward**：为**函数**（非 reward model），支持三种模式，通过参数切换。
-- **RL 前 SFT**：可先用心理咨询对话数据集做 SFT（`configs/sft_counseling.yaml` + `scripts/run_sft_counseling.py`），再用该模型做 PPO。
+- **RL 前 SFT**：可先用心理咨询对话数据集做 SFT（`configs/sft_counseling.yaml` + `scripts/sft/run_sft_counseling.py`），再用该模型做 PPO。
 
 ## Reward 模式
 
@@ -33,15 +33,15 @@
   `beta  = clamp((step - S2) / warmup_steps, 0, 1)`  
   `reward = baseline + alpha * w2 * trend - beta * w3 * volatility`
 - **含义**：随训练步数 `step` 先 warmup 趋势项（alpha），再 warmup 波动惩罚（beta），便于分阶段稳定训练。需传入 `--S1`、`--S2`、`--warmup_steps`。
-- **阶段**：可在 step 到达 S1、S2 及训练结束时各存一次 checkpoint，用于「mode3 各 stage」的评估（见 `scripts/eval_all_models.py`）。
+- **阶段**：可在 step 到达 S1、S2 及训练结束时各存一次 checkpoint，用于「mode3 各 stage」的评估（见 `scripts/eval/eval_all_models.py`）。
 
 ## 脚本与调用
 
-- **心理咨询 SFT（RL 前）**：`scripts/run_sft_counseling.py --config configs/sft_counseling.yaml`  
+- **心理咨询 SFT（RL 前）**：`scripts/sft/run_sft_counseling.py --config configs/sft_counseling.yaml`  
   - 数据：`configs/sft_counseling.yaml` 中 `data.train_file` / `eval_file`（默认 `data/counseling_dialogue/train.jsonl`）。每行 jsonl 需含 `user`、`assistant`，可选 `system`。  
   - 输出：`outputs/sft_counseling`（可作 RL 的 sft_model_path）。
 
-- **入口脚本**：`scripts/run_ppo_emo.py`  
+- **入口脚本**：`scripts/rl/run_ppo_emo.py`  
   - `--data_dir`：profile 数据目录（默认 `data/data`）。  
   - `--emo_adapter`：情绪分类 LoRA 路径（默认 `emo_classifier_lora/checkpoint-11025`）。  
   - `--reward_mode`：`mode1`、`mode2` 或 `mode3`。  
@@ -71,7 +71,7 @@
 
 - **Adam 用在哪**：Adam 用来训练 PPO 的 **policy（actor）和 critic** 的参数，不是用来更新 w1、w2、w3。w1、w2、w3 是 **reward 公式里的超参数**，不参与反向传播。
 - **怎么找最优权重**：把 w1、w2、w3（以及可选的 `trend_n`）当作超参数做搜索，常用两种方式：
-  1. **自动搜索（推荐）**：用 **Optuna** 等做贝叶斯/TPE 搜索，在验证集上最大化你关心的指标（例如平均最终 emo_point、或「平均 reward」、或 PPO 若干步后的验证表现）。见下方脚本 `scripts/tune_reward_weights.py`。
+  1. **自动搜索（推荐）**：用 **Optuna** 等做贝叶斯/TPE 搜索，在验证集上最大化你关心的指标（例如平均最终 emo_point、或「平均 reward」、或 PPO 若干步后的验证表现）。见下方脚本 `scripts/reward/tune_reward_weights.py`。
   2. **手动/网格**：先设 w1=1, w2=w3=0（等价 mode1），再逐步加大 w2、w3 做 ablation，看验证集上最终情绪分和训练稳定性。
 
 目标指标可以选其一或组合使用：
@@ -79,10 +79,10 @@
 - 验证集上 **平均 r_total**（在你定的 w1,w2,w3 下算出的 reward）；
 - 或 PPO 训练若干步后 **验证集 mean emo_point**（更准但更耗算力）。
 
-**自动搜索脚本**：`scripts/tune_reward_weights.py`（需安装 `pip install optuna`）。
+**自动搜索脚本**：`scripts/reward/tune_reward_weights.py`（需安装 `pip install optuna`）。
 
 - 用法：先准备验证集 rollout 结果，每行一个 JSON：`{"emo_point": 65, "emo_point_turns": [50,52,...,65]}`，保存为 `val_rollouts.jsonl`。可在跑验证集多轮对话时，把每条样本的 `non_tensor_batch` 里 `emo_point` 和 `emo_point_turns` 写出。
-- 运行：`python scripts/tune_reward_weights.py --val_rollouts val_rollouts.jsonl --n_trials 50 --metric mean_reward`
+- 运行：`python scripts/reward/tune_reward_weights.py --val_rollouts val_rollouts.jsonl --n_trials 50 --metric mean_reward`
 - 输出：最优的 `w1, w2, w3, trend_n`；将这些参数填入 mode2 的 PPO 训练即可。
 - 不提供 `--val_rollouts` 时会用示例数据试跑，仅作脚本测试用。
 
@@ -90,7 +90,7 @@
 
 ## 全模型评估（base / SFT / SFT+RL mode1/2/3 / mode3 各 stage）
 
-**脚本**：`scripts/eval_all_models.py`
+**脚本**：`scripts/eval/eval_all_models.py`
 
 - **对比模型**：base、sft_only（仅心理咨询 SFT）、sft_rl_mode1、sft_rl_mode2、sft_rl_mode3、sft_rl_mode3_stage1/2/3（三段式各阶段 checkpoint）。路径可在脚本内 `DEFAULT_MODEL_PATHS` 或通过 `--model_paths` 覆盖。
 - **评估维度**：  
@@ -98,5 +98,5 @@
   2. **情绪改善**：终端情绪分、情绪轨迹改善、成功/失败率。  
   3. **综合能力**（防遗忘）：MATH500、LiveCodeBench、IFEval（当前为占位，可接 OpenCompass 等）。
 - **运行示例**：  
-  `python scripts/eval_all_models.py --models base sft_only sft_rl_mode1 sft_rl_mode2 sft_rl_mode3 sft_rl_mode3_stage1 sft_rl_mode3_stage2 sft_rl_mode3_stage3 --output outputs/eval_all_results.json`  
+  `python scripts/eval/eval_all_models.py --models base sft_only sft_rl_mode1 sft_rl_mode2 sft_rl_mode3 sft_rl_mode3_stage1 sft_rl_mode3_stage2 sft_rl_mode3_stage3 --output outputs/eval_all_results.json`  
   若仅测脚本可加 `--skip_load`（不加载模型，仅输出占位指标）。

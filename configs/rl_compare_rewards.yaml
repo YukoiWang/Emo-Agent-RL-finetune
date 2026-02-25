@@ -1,5 +1,5 @@
 # 小规模实验：比较 mode1 / mode2 / mode3 三种 reward 效果（多轮 PPO）
-# 用法：python scripts/run_reward_comparison.py --config configs/rl_compare_rewards.yaml
+# 用法：python scripts/rl/run_reward_comparison.py --config configs/rl_compare_rewards.yaml
 seed: 42
 
 model:

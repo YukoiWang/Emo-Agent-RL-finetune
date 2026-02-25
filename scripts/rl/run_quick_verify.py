@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 快速验证：非 static-rl 路径下的 PPO（三种 reward 模式）、GRPO。
-跑完后可用 scripts/plot_rl_curves.py 画 KL / reward 曲线，并用 scripts/eval_rl_models.py 评估。
+跑完后可用 scripts/eval/plot_rl_curves.py 画 KL / reward 曲线，并用 scripts/eval/eval_rl_models.py 评估。
 
 用法:
   # 默认每类小步数验证（PPO 每模式 50 步，GRPO 50 步）
-  python scripts/run_quick_verify.py
+  python scripts/rl/run_quick_verify.py
 
   # 指定步数、只跑 PPO 三种模式
-  python scripts/run_quick_verify.py --ppo-steps 30 --skip-grpo
+  python scripts/rl/run_quick_verify.py --ppo-steps 30 --skip-grpo
 
   # 只跑 GRPO
-  python scripts/run_quick_verify.py --skip-ppo
+  python scripts/rl/run_quick_verify.py --skip-ppo
 """
 import argparse
 import copy
@@ -20,7 +20,7 @@ import os
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -95,9 +95,9 @@ def main():
     print("\n" + "=" * 60)
     print("【快速验证完成】")
     print(f"  输出根目录: {base.absolute()}")
-    print("  画图:   python scripts/plot_rl_curves.py --log-dir " + str(base))
-    print("  简单推理: python scripts/eval_rl_models.py --model-dir " + str(base))
-    print("  全维度评估(Sentient+情绪+综合): python scripts/eval_all_models.py --quick-verify-dir " + str(base))
+    print("  画图:   python scripts/eval/plot_rl_curves.py --log-dir " + str(base))
+    print("  简单推理: python scripts/eval/eval_rl_models.py --model-dir " + str(base))
+    print("  全维度评估(Sentient+情绪+综合): python scripts/eval/eval_all_models.py --quick-verify-dir " + str(base))
     print("=" * 60)
 
 

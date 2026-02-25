@@ -34,6 +34,6 @@ echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/d
 echo "Python: $(python --version)"
 echo "================================"
 
-python scripts/run_sft_empathetic.py --config configs/sft_empathetic.yaml
+python scripts/sft/run_sft_empathetic.py --config configs/sft_empathetic.yaml
 
 echo "=== Job finished at $(date) ==="

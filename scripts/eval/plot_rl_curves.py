@@ -4,8 +4,8 @@
 根据 quick_verify 或任意 RL 实验目录下的 training_log.jsonl / trainer_state.json 画 KL、reward、loss 曲线。
 
 用法:
-  python scripts/plot_rl_curves.py --log-dir outputs/quick_verify
-  python scripts/plot_rl_curves.py --log-dir outputs/quick_verify --out-dir outputs/quick_verify/plots
+  python scripts/eval/plot_rl_curves.py --log-dir outputs/quick_verify
+  python scripts/eval/plot_rl_curves.py --log-dir outputs/quick_verify --out-dir outputs/quick_verify/plots
 """
 import argparse
 import json

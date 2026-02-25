@@ -4,8 +4,8 @@
 快速对比三种 reward 模式的效果。
 
 用法：
-  python scripts/compare_reward_modes.py                    # 离线对比（秒级，无需 GPU）
-  python scripts/compare_reward_modes.py --quick-ppo        # 各跑 20 步 PPO 对比（需 GPU，约 2–5 分钟）
+  python scripts/reward/compare_reward_modes.py                    # 离线对比（秒级，无需 GPU）
+  python scripts/reward/compare_reward_modes.py --quick-ppo        # 各跑 20 步 PPO 对比（需 GPU，约 2–5 分钟）
 """
 import argparse
 import os
@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 

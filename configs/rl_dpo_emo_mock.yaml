@@ -1,5 +1,5 @@
 # On-policy DPO 快速测试（mock 用户模拟器，无需 API）
-# 用法：python scripts/run_rl.py --config configs/rl_dpo_emo_mock.yaml
+# 用法：python scripts/rl/run_rl.py --config configs/rl_dpo_emo_mock.yaml
 seed: 42
 
 model:

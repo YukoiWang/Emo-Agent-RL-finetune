@@ -5,7 +5,7 @@ On-policy DPO 训练入口：用 train_profile 模拟用户，每轮生成 k 个
 情感打分选 best/worst 构造偏好对，再 DPO 训练。
 
 用法：
-  python scripts/run_dpo_emo.py --config configs/rl_dpo_emo.yaml
+  python scripts/rl/run_dpo_emo.py --config configs/rl_dpo_emo.yaml
 
 需设置 DEEPSEEK_API_KEY 或 DASHSCOPE_API_KEY 供用户模拟器调用。
 """
@@ -14,7 +14,7 @@ import os
 import sys
 from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 

@@ -4,15 +4,15 @@
 对 quick_verify 或任意 RL 实验目录下的 final 模型做简单推理评估：用固定 prompt 生成回复并打印，便于人工对比。
 
 用法:
-  python scripts/eval_rl_models.py --model-dir outputs/quick_verify
-  python scripts/eval_rl_models.py --model-dir outputs/quick_verify --prompts "我最近工作压力很大" "家里出了点事，心情不好"
+  python scripts/eval/eval_rl_models.py --model-dir outputs/quick_verify
+  python scripts/eval/eval_rl_models.py --model-dir outputs/quick_verify --prompts "我最近工作压力很大" "家里出了点事，心情不好"
 """
 import argparse
 import os
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

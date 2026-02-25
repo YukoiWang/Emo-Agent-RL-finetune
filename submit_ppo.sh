@@ -28,6 +28,6 @@ echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/d
 echo "Python: $(python --version)"
 echo "================================"
 
-python scripts/run_rl.py --config configs/rl_default.yaml
+python scripts/rl/run_rl.py --config configs/rl_default.yaml
 
 echo "=== Job finished at $(date) ==="

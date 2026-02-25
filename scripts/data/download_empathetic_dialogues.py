@@ -10,8 +10,8 @@ EmpatheticDialogues 来自 Facebook Research，包含共情对话，适合用于
 
 用法:
     conda activate emo  # 或你的环境
-    python scripts/download_empathetic_dialogues.py
-    python scripts/download_empathetic_dialogues.py --output-dir data/empathetic_dialogues
+    python scripts/data/download_empathetic_dialogues.py
+    python scripts/data/download_empathetic_dialogues.py --output-dir data/empathetic_dialogues
 
 依赖: 无额外依赖（仅标准库）
 """

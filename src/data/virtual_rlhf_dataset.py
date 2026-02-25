@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-VirtualRLHFDataset: system_prompt_trained + 首条用户消息（来自 player_simulator.reply(None)）
+[已废弃 / 未使用] VirtualRLHFDataset: system_prompt_trained + 首条用户消息（来自 player_simulator.reply(None)）
 用于 RL 多轮对话训练的虚拟 HF 格式数据集。
+
+当前仓库内无代码引用此类，仅保留作参考。新逻辑请使用 profile_dataset + ppo_emo_rollout 等。
 """
 from __future__ import annotations
 

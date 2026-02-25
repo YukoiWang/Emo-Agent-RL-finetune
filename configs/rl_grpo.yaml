@@ -1,5 +1,5 @@
 # GRPO 训练配置（仿照 PPO 的 rl_test.yaml）
-# 使用: python scripts/run_rl.py --config configs/rl_grpo.yaml
+# 使用: python scripts/rl/run_rl.py --config configs/rl_grpo.yaml
 seed: 42
 
 model:

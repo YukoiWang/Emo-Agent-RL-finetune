@@ -98,5 +98,5 @@ python static-rl/run_grpo.py --config static-rl/configs/grpo.yaml
 
 ## 前置依赖
 
-- 完成 EmpatheticDialogues SFT：`python scripts/run_sft_empathetic.py`（或等价流程）
+- 完成 EmpatheticDialogues SFT：`python scripts/sft/run_sft_empathetic.py`（或等价流程）
 - 或修改配置中的 `sft_model_path` 为可用基础模型路径

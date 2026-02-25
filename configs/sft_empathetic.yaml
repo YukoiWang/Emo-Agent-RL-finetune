@@ -1,6 +1,6 @@
 # EmpatheticDialogues SFT（共情对话微调）
 # 使用 Qwen2.5-7B-Instruct + LoRA
-# 数据需先运行: python scripts/download_empathetic_dialogues.py
+# 数据需先运行: python scripts/data/download_empathetic_dialogues.py
 seed: 42
 
 model:

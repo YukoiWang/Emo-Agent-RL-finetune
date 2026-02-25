@@ -16,7 +16,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 # 训练脚本 run_emo_senti_base.py 的保存路径（按脚本位置解析为绝对路径）
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "emo_classifier_base"))
+OUTPUT_DIR = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "emo_classifier_base"))
 
 
 def _resolve_model_dir(output_dir: str) -> str:

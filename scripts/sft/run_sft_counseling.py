@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 在 RL 微调之前，先用心理咨询对话数据集做 SFT。
-用法：python scripts/run_sft_counseling.py [--config configs/sft_counseling.yaml]
+用法：python scripts/sft/run_sft_counseling.py [--config configs/sft_counseling.yaml]
 数据：config 中 train_file / eval_file 指向的 jsonl，每行需含 "user", "assistant"，可选 "system"。
      若使用 HuggingFace 数据集，可先将数据转为上述 jsonl 或修改 load_sft_dataset 支持 HF 名。
 """
@@ -11,7 +11,7 @@ import argparse
 import os
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 

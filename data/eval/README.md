@@ -2,7 +2,7 @@
 
 ## Sentient-Benchmark（情感智能基准）
 
-用于 `scripts/eval_all_models.py` 的 `--sentient_data`（默认 `data/eval/sentient_benchmark.jsonl`）。
+用于 `scripts/eval/eval_all_models.py` 的 `--sentient_data`（默认 `data/eval/sentient_benchmark.jsonl`）。
 
 - **格式占位**：每行一个 JSON，例如  
   `{"messages": [{"role":"user","content":"..."}, ...], "reference_insight": "..."}`  
