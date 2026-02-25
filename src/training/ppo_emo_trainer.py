@@ -143,16 +143,8 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         device=device,
     )
     hidden_size = mt.model.config.hidden_size
-    # Critic 使用独立 backbone（frozen），与 Actor 同结构
-    mt_critic = load_sft_model(
-        sft_model_path=model_cfg["sft_model_path"],
-        dtype=model_cfg.get("dtype", "bfloat16"),
-        use_lora=False,
-        device_map=dev_map,
-    )
-    for p in mt_critic.model.parameters():
-        p.requires_grad = False
-    critic = Critic(mt_critic.model, hidden_size, dropout=0.0).to(device)
+    # Critic 复用 Ref backbone，不再加载第三份模型，节省 ~20GB 显存
+    critic = Critic(actor_ref.ref, hidden_size, dropout=0.0).to(device)
 
     # ---------- 2. 数据 ----------
     dataset = ProfileDataset(
