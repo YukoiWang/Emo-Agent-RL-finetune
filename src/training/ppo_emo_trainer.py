@@ -2,6 +2,9 @@
 """
 多轮 PPO 训练：Profile 数据 + 用户模拟器多轮对话 → collect_rollouts_emo → GAE → PPO 更新。
 完整流程入口：run_ppo_emo_training(cfg)。
+
+多卡训练：使用 `accelerate launch scripts/rl/run_rl.py --config xxx.yaml`，
+或在 config 中设置 training.use_accelerate: true 后由 run_rl 自动用 accelerate 启动。
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch as T
 from torch.utils.data import DataLoader
+from accelerate import Accelerator
 
 from src.data.profile_dataset import ProfileDataset, build_initial_prompt
 from src.models.modeling import load_sft_model, ModelAndTokenizer
@@ -92,6 +96,9 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
     seed = cfg.get("seed", 42)
     T.manual_seed(seed)
 
+    accelerator = Accelerator()
+    device = accelerator.device
+
     model_cfg = cfg.get("model", {})
     data_cfg = cfg.get("data", {}) or {}
     rollout_cfg = cfg.get("rollout", {}) or {}
@@ -107,7 +114,8 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
     save_total_limit = training_cfg.get("save_total_limit", 3)
     logging_steps = training_cfg.get("logging_steps", 10)
 
-    device = T.device("cuda" if T.cuda.is_available() else "cpu")
+    if accelerator.is_main_process:
+        print(f"[PPO-Emo] Accelerate: {accelerator.num_processes} process(es), device={device}")
     use_planning_emo = rollout_cfg.get("use_planning_emo", True)
     reward_mode = reward_cfg.get("reward_mode", "mode1")
 
@@ -191,21 +199,31 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         lr=lr,
     )
 
+    # ---------- 4b. Accelerate prepare（多卡时自动 DDP）----------
+    actor_ref, critic, optimizer, dataloader = accelerator.prepare(
+        actor_ref, critic, optimizer, dataloader
+    )
+
     # ---------- 5. 训练循环 ----------
-    os.makedirs(output_dir, exist_ok=True)
+    if accelerator.is_main_process:
+        os.makedirs(output_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
     log_path = os.path.join(output_dir, "training_log.jsonl")
-    log_file = open(log_path, "w", encoding="utf-8")
+    log_file = open(log_path, "w", encoding="utf-8") if accelerator.is_main_process else None
     global_step = 0
     step_counter = [0]
 
     def _save():
+        if not accelerator.is_main_process:
+            return
+        unwrapped = accelerator.unwrap_model(actor_ref)
         ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
-        actor_ref.actor.save_pretrained(ckpt_dir)
+        unwrapped.actor.save_pretrained(ckpt_dir)
         tokenizer.save_pretrained(ckpt_dir)
         print(f"  [saved] {ckpt_dir}")
 
     def _prune():
-        if save_total_limit <= 0:
+        if not accelerator.is_main_process or save_total_limit <= 0:
             return
         pattern = os.path.join(output_dir, "checkpoint-*")
         ckpts = sorted(glob.glob(pattern), key=lambda p: int(p.split("-")[-1]))
@@ -331,31 +349,36 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
 
         reward_mean = sum(data["rewards"]) / len(data["rewards"]) if data["rewards"] else 0.0
         elapsed = time.time() - start_time
-        if (global_step + 1) % logging_steps == 0:
+        if accelerator.is_main_process and (global_step + 1) % logging_steps == 0:
             print(
                 f"  step={global_step + 1}/{total_steps} | reward_mean={reward_mean:.4f} | "
                 f"policy_loss={policy_loss.item():.4f} value_loss={value_loss.item():.4f} "
                 f"kl_loss={kl_loss.item():.4f} | {elapsed:.0f}s"
             )
-        log_record = {
-            "step": global_step,
-            "reward_mean": reward_mean,
-            "policy_loss": policy_loss.item(),
-            "value_loss": value_loss.item(),
-            "kl_loss": kl_loss.item(),
-            "total_loss": total_loss.item(),
-            "elapsed": elapsed,
-        }
-        log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
-        log_file.flush()
+        if accelerator.is_main_process and log_file is not None:
+            log_record = {
+                "step": global_step,
+                "reward_mean": reward_mean,
+                "policy_loss": policy_loss.item(),
+                "value_loss": value_loss.item(),
+                "kl_loss": kl_loss.item(),
+                "total_loss": total_loss.item(),
+                "elapsed": elapsed,
+            }
+            log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+            log_file.flush()
 
         global_step += 1
         if save_steps and global_step % save_steps == 0:
             _save()
             _prune()
 
-    log_file.close()
-    final_dir = os.path.join(output_dir, "final")
-    actor_ref.actor.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
-    print(f"[PPO-Emo] 多轮训练完成，模型已保存到 {final_dir}，日志: {log_path}")
+    if log_file is not None:
+        log_file.close()
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        final_dir = os.path.join(output_dir, "final")
+        unwrapped = accelerator.unwrap_model(actor_ref)
+        unwrapped.actor.save_pretrained(final_dir)
+        tokenizer.save_pretrained(final_dir)
+        print(f"[PPO-Emo] 多轮训练完成，模型已保存到 {final_dir}，日志: {log_path}")

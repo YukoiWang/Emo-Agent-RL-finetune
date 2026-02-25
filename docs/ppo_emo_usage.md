@@ -67,6 +67,43 @@
 
 ---
 
+## OOM 调优与多卡训练
+
+### 单卡仍 OOM 时可尝试的配置
+
+在已有 `gradient_checkpointing: true`、`batch_size: 2`、`mini_batch_size: 1` 前提下，可继续减小显存占用：
+
+| 参数 | 当前值 | 建议尝试 | 说明 |
+|------|--------|----------|------|
+| `data.batch_size` | 2 | 1 | 每步 rollout 样本数 |
+| `data.max_scene_len` | 1500 | 800 或 500 | 场景文本最大长度 |
+| `data.max_prompt_length` | 256 | 192 | prompt 截断 |
+| `rollout.max_turns` | 8 | 4 | 减少对话轮数 |
+| `rollout.max_new_tokens_per_turn` | 128 | 64 | 每轮生成长度 |
+| `rl.ppo.ppo_epochs` | 4 | 2 | PPO 更新轮数 |
+
+### 多卡训练（PPO / GRPO）
+
+使用 HuggingFace Accelerate 做 DDP。**命令行启动**：
+
+```bash
+# 2 卡
+accelerate launch --num_processes=2 scripts/rl/run_rl.py --config configs/rl_default.yaml
+
+# 4 卡
+accelerate launch --num_processes=4 scripts/rl/run_rl.py --config configs/rl_default.yaml
+```
+
+**SLURM 提交**：使用 `submit_ppo_multi.sh`（修改 `#SBATCH --gres=gpu:N` 指定卡数）：
+
+```bash
+sbatch submit_ppo_multi.sh
+```
+
+多卡时，DataLoader 自动按 rank 分片，每卡独立 rollout + 更新，梯度跨卡同步，有效 batch = `batch_size × num_gpus`。
+
+---
+
 ## 权重 w1、w2、w3 怎么调优？
 
 - **Adam 用在哪**：Adam 用来训练 PPO 的 **policy（actor）和 critic** 的参数，不是用来更新 w1、w2、w3。w1、w2、w3 是 **reward 公式里的超参数**，不参与反向传播。

@@ -9,6 +9,8 @@ GRPO (Group Relative Policy Optimization) 训练模块。
 - 组内相对 advantage: A_i = (R_i - mean(R)) / (std(R) + eps)
 - Clipped policy gradient + KL penalty (against frozen ref)
 - 无需 Critic 网络
+
+多卡训练：使用 `accelerate launch scripts/rl/run_rl.py --config xxx.yaml`
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from accelerate import Accelerator
 
 from src.data.rl_dataset import load_rl_dataset
 from src.models.modeling import load_sft_model, ModelAndTokenizer
@@ -94,12 +97,16 @@ def run_grpo_training(
     """
     torch.manual_seed(cfg.get("seed", 42))
 
+    accelerator = Accelerator()
+    device = accelerator.device
+
     model_cfg = cfg["model"]
     data_cfg = cfg["data"]
     rl_cfg = cfg.get("rl", {}).get("grpo", {})
     training_cfg = cfg.get("training", {})
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if accelerator.is_main_process:
+        print(f"[GRPO] Accelerate: {accelerator.num_processes} process(es), device={device}")
 
     # -- Reward --
     if reward_fn is None:
@@ -164,15 +171,22 @@ def run_grpo_training(
     save_steps = training_cfg.get("save_steps", 500)
     output_dir = training_cfg.get("output_dir", "outputs/grpo")
 
+    # -- Optimizer & Accelerate prepare（多卡时自动 DDP）--
     optimizer = torch.optim.AdamW(
         [p for p in actor.parameters() if p.requires_grad], lr=lr,
     )
+    actor, optimizer, dataloader = accelerator.prepare(actor, optimizer, dataloader)
+    # ref_model 不参与 DDP，保持在各卡本地
+    ref_model = ref_model.to(device)
 
     # -- Training loop --
-    print(f"[GRPO] 开始训练: total_steps={total_steps}, G={num_generations}, lr={lr}, eps={epsilon}")
-    os.makedirs(output_dir, exist_ok=True)
+    if accelerator.is_main_process:
+        print(f"[GRPO] 开始训练: total_steps={total_steps}, G={num_generations}, lr={lr}, eps={epsilon}")
+    if accelerator.is_main_process:
+        os.makedirs(output_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
     log_path = os.path.join(output_dir, "training_log.jsonl")
-    log_file = open(log_path, "w", encoding="utf-8")
+    log_file = open(log_path, "w", encoding="utf-8") if accelerator.is_main_process else None
     data_iter = iter(dataloader)
     global_step = 0
     total_loss_acc = 0.0
@@ -252,18 +266,19 @@ def run_grpo_training(
             total_loss_acc += loss.item()
             total_reward_acc += r_mean.item()
             kl_avg = (kl_loss / valid_count).item()
-            log_record = {
-                "step": global_step,
-                "reward_mean": r_mean.item(),
-                "loss": loss.item(),
-                "kl_loss": kl_avg,
-            }
-            log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
-            log_file.flush()
+            if accelerator.is_main_process and log_file is not None:
+                log_record = {
+                    "step": global_step,
+                    "reward_mean": r_mean.item(),
+                    "loss": loss.item(),
+                    "kl_loss": kl_avg,
+                }
+                log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+                log_file.flush()
 
         global_step += 1
 
-        if global_step % logging_steps == 0:
+        if accelerator.is_main_process and global_step % logging_steps == 0:
             avg_loss = total_loss_acc / logging_steps
             avg_reward = total_reward_acc / logging_steps
             elapsed = time.time() - t0
@@ -272,15 +287,19 @@ def run_grpo_training(
             total_loss_acc = 0.0
             total_reward_acc = 0.0
 
-        if save_steps and global_step % save_steps == 0:
+        if save_steps and global_step % save_steps == 0 and accelerator.is_main_process:
+            unwrapped = accelerator.unwrap_model(actor)
             ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
-            actor.save_pretrained(ckpt_dir)
+            unwrapped.save_pretrained(ckpt_dir)
             tokenizer.save_pretrained(ckpt_dir)
             print(f"  [saved] {ckpt_dir}")
 
-    log_file.close()
-    # 最终保存
-    final_dir = os.path.join(output_dir, "final")
-    actor.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
-    print(f"[GRPO] 训练完成，模型已保存到 {final_dir}，指标日志: {log_path}")
+    if log_file is not None:
+        log_file.close()
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        unwrapped = accelerator.unwrap_model(actor)
+        final_dir = os.path.join(output_dir, "final")
+        unwrapped.save_pretrained(final_dir)
+        tokenizer.save_pretrained(final_dir)
+        print(f"[GRPO] 训练完成，模型已保存到 {final_dir}，指标日志: {log_path}")
