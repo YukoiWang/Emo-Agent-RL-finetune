@@ -120,12 +120,15 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
     reward_mode = reward_cfg.get("reward_mode", "mode1")
 
     # ---------- 1. 模型 ----------
+    # 多卡时每 rank 加载到自己的 GPU，避免全部挤到 cuda:0
+    dev_map = {"": accelerator.local_process_index} if accelerator.num_processes > 1 else None
     lora_cfg = model_cfg.get("lora") if isinstance(model_cfg.get("lora"), dict) else None
     mt: ModelAndTokenizer = load_sft_model(
         sft_model_path=model_cfg["sft_model_path"],
         dtype=model_cfg.get("dtype", "bfloat16"),
         use_lora=model_cfg.get("use_lora", True),
         lora_config=lora_cfg,
+        device_map=dev_map,
     )
     if rl_cfg.get("gradient_checkpointing", False) and hasattr(mt.model, "gradient_checkpointing_enable"):
         mt.model.gradient_checkpointing_enable()
@@ -145,6 +148,7 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         sft_model_path=model_cfg["sft_model_path"],
         dtype=model_cfg.get("dtype", "bfloat16"),
         use_lora=False,
+        device_map=dev_map,
     )
     for p in mt_critic.model.parameters():
         p.requires_grad = False

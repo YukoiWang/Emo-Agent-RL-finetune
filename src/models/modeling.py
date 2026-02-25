@@ -59,20 +59,24 @@ def load_sft_model(
     dtype: str = "bfloat16",
     use_lora: bool = True,
     lora_config: Optional[dict] = None,
+    device_map: Optional[dict] = None,
 ) -> ModelAndTokenizer:
     """
     从 SFT 输出目录或 HF 模型 ID 加载模型（可继续用于 RL 微调）。
     use_lora=True 时在加载的模型上施加 LoRA，仅训练 LoRA 参数。
+    device_map: 可选，多卡 DDP 时应传 {"": local_rank}，确保每 rank 加载到自己的 GPU。
     """
     tokenizer = AutoTokenizer.from_pretrained(sft_model_path, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    if device_map is None:
+        device_map = {"": 0} if torch.cuda.is_available() else "auto"
     torch_dtype = torch.bfloat16 if dtype == "bfloat16" else (torch.float16 if dtype == "float16" else "auto")
     model = AutoModelForCausalLM.from_pretrained(
         sft_model_path,
         torch_dtype=torch_dtype,
-        device_map={"": 0} if torch.cuda.is_available() else "auto",
+        device_map=device_map,
     )
 
     if use_lora:
