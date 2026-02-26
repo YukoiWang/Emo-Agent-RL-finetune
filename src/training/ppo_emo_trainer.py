@@ -18,12 +18,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import torch as T
+
+torch = T  # 兼容直接使用 torch 的代码
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 
 from src.data.profile_dataset import ProfileDataset, build_initial_prompt
 from src.models.modeling import load_sft_model, ModelAndTokenizer
-from src.training.emo_analyzer import build_emo_analyzer, emo_analyzer_fn_from_analyzer
 from src.training.ppo_emo_rollout import collect_rollouts_emo
 from src.training.ppo_training import ActorRefRollout, Critic, PPOMemory, _pad_list_to_tensor
 
@@ -77,7 +78,6 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
       reward:
         reward_mode: "mode1"
         w1, w2, w3, trend_n: ...
-        emo_adapter_path: ...  # use_planning_emo=False 时需要
         S1, S2, warmup_steps: ...  # mode3
       rl:
         ppo:
@@ -116,12 +116,18 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
 
     if accelerator.is_main_process:
         print(f"[PPO-Emo] Accelerate: {accelerator.num_processes} process(es), device={device}")
-    use_planning_emo = rollout_cfg.get("use_planning_emo", True)
     reward_mode = reward_cfg.get("reward_mode", "mode1")
 
     # ---------- 1. 模型 ----------
-    # 多卡时每 rank 加载到自己的 GPU，避免全部挤到 cuda:0
-    dev_map = {"": accelerator.local_process_index} if accelerator.num_processes > 1 else None
+    # 设备映射：若每进程能看到多块 GPU，用 local_process_index 分配；否则用 0
+    if T.cuda.is_available():
+        n_visible = T.cuda.device_count()
+        if accelerator.num_processes > 1 and n_visible >= accelerator.num_processes:
+            dev_map = {"": accelerator.local_process_index}
+        else:
+            dev_map = {"": 0}
+    else:
+        dev_map = None
     lora_cfg = model_cfg.get("lora") if isinstance(model_cfg.get("lora"), dict) else None
     mt: ModelAndTokenizer = load_sft_model(
         sft_model_path=model_cfg["sft_model_path"],
@@ -159,16 +165,8 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         collate_fn=lambda x: x,
     )
 
-    # ---------- 3. 用户模拟与情感 ----------
+    # ---------- 3. 用户模拟与情感（使用 planning_reply） ----------
     user_llm_fn = _build_user_llm_fn(cfg)
-    emo_analyzer_fn = None
-    if not use_planning_emo:
-        emo_path = reward_cfg.get("emo_adapter_path")
-        if not emo_path:
-            raise ValueError("use_planning_emo=False 时需配置 reward.emo_adapter_path")
-        analyzer = build_emo_analyzer(emo_path, device=str(device))
-        emo_analyzer_fn = emo_analyzer_fn_from_analyzer(analyzer)
-
     planning_llm_fn = None
     sft_model_path = model_cfg.get("sft_model_path")
     target_default = rollout_cfg.get("target", "eq")
@@ -247,13 +245,15 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         ]
 
         step_counter[0] = global_step
+        # rollout 阶段用 unwrap 后的模型，DDP 包装器没有 .generate() 方法
+        actor_ref_for_rollout = accelerator.unwrap_model(actor_ref)
+        critic_for_rollout = accelerator.unwrap_model(critic)
         collect_kw = {
             "batch_items": batch_items,
-            "actor_ref": actor_ref,
-            "critic": critic,
+            "actor_ref": actor_ref_for_rollout,
+            "critic": critic_for_rollout,
             "tokenizer": tokenizer,
             "user_llm_fn": user_llm_fn,
-            "emo_analyzer_fn": emo_analyzer_fn,
             "memory": memory,
             "get_ref_log_probs_fn": get_ref_log_probs_fn,
             "device": device,
@@ -267,7 +267,6 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
             "do_sample": True,
             "temperature": rollout_cfg.get("temperature", 0.8),
             "top_p": rollout_cfg.get("top_p", 0.95),
-            "use_planning_emo": use_planning_emo,
             "target": target_default,
             "sft_model_path": sft_model_path,
             "planning_llm_fn": planning_llm_fn,

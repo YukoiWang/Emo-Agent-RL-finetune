@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 PPO 多轮对话训练入口：
-- 从 data/data 加载用户形象，生成多轮对话（Actor + PlayerSimulator）
+- 从 data/data 加载用户形象，生成多轮对话（Actor + PlayerSimulatorWithPlanning）
 - Reward 为函数：模式1（仅最终 emo_point/100）或模式2（baseline + trend - volatility），通过参数切换
-- 使用 emo_classifier_lora 分析用户情感并更新 emo_point
+- 使用 planning_reply（LLM prompt）分析用户情感并更新 emo_point
 """
 from __future__ import annotations
 
@@ -20,8 +20,6 @@ import torch as T
 from torch.utils.data import DataLoader
 
 from src.data.profile_dataset import ProfileDataset
-from src.training.emo_analyzer import build_emo_analyzer, emo_analyzer_fn_from_analyzer
-from src.training.hard_player_simulator_dsv3 import PlayerSimulator
 from src.training.ppo_emo_rollout import run_multi_turn_rollout_batch
 from src.training.reward_emo import compute_reward_tensors
 
@@ -52,7 +50,7 @@ def get_user_llm_fn(api: str = "mock"):
 def main():
     parser = argparse.ArgumentParser(description="PPO 多轮对话（用户形象 + emo_point reward）")
     parser.add_argument("--data_dir", type=str, default="/home/yukiwang/xlwy/data/data")
-    parser.add_argument("--emo_adapter", type=str, default="/home/yukiwang/xlwy/emo_classifier_lora/checkpoint-11025")
+    parser.add_argument("--sft_model_path", type=str, default=None, help="本地 SFT 模型路径，用于 planning 情感分析")
     parser.add_argument("--reward_mode", type=str, default="mode1", choices=["mode1", "mode2", "mode3"])
     parser.add_argument("--w1", type=float, default=1.0, help="mode2/mode3 baseline weight")
     parser.add_argument("--w2", type=float, default=0.3, help="mode2/mode3 trend weight")
@@ -70,11 +68,7 @@ def main():
 
     device = T.device(args.device)
 
-    # 1) 情绪分析器（用于 PlayerSimulator）
-    emo_analyzer = build_emo_analyzer(args.emo_adapter, device=args.device)
-    emo_analyzer_fn = emo_analyzer_fn_from_analyzer(emo_analyzer)
-
-    # 2) 用户 LLM（模拟器用）
+    # 1) 用户 LLM（模拟器用）
     user_llm_fn = get_user_llm_fn(args.user_llm)
 
     # 3) 数据集与 DataLoader
@@ -100,7 +94,7 @@ def main():
         print("未加载模型，退出。请先实现模型加载后取消下方 return。")
         return
 
-    # 5) 跑一个 batch 演示
+    # 5) 跑一个 batch 演示（使用 PlayerSimulatorWithPlanning + planning_reply）
     batch_items = next(iter(dataloader))
     gen_batch = run_multi_turn_rollout_batch(
         batch_items=batch_items,
@@ -108,10 +102,10 @@ def main():
         critic=critic,
         tokenizer=tokenizer,
         user_llm_fn=user_llm_fn,
-        emo_analyzer_fn=emo_analyzer_fn,
         device=device,
         max_turns=args.max_turns,
         max_new_tokens_per_turn=args.max_new_tokens_per_turn,
+        sft_model_path=args.sft_model_path,
     )
 
     gen_batch["non_tensor_batch"] = gen_batch.get("non_tensor_batch") or {}

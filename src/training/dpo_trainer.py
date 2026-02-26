@@ -67,6 +67,37 @@ def run_dpo_training(cfg: Dict[str, Any]) -> None:
                 "请提供 (prompt/user, chosen, rejected) 格式的偏好对 jsonl。"
             )
 
+    # 确保 chosen/rejected 为字符串（TRL tokenizer 要求 str）
+    def _ensure_str(x):
+        if isinstance(x, str):
+            return x.strip()
+        if isinstance(x, list):
+            # 可能是 chat 格式 [{"role":"assistant","content":"..."}]
+            parts = []
+            for m in x:
+                if isinstance(m, dict) and m.get("content"):
+                    parts.append(str(m["content"]).strip())
+            return " ".join(parts) if parts else ""
+        return str(x) if x is not None else ""
+
+    def ensure_string_format(example):
+        example["prompt"] = _ensure_str(example.get("prompt", ""))
+        example["chosen"] = _ensure_str(example.get("chosen", ""))
+        example["rejected"] = _ensure_str(example.get("rejected", ""))
+        return example
+
+    dataset = dataset.map(
+        ensure_string_format,
+        num_proc=data_cfg.get("num_proc", 4),
+        desc="Ensure prompt/chosen/rejected are strings",
+    )
+    # 过滤空 chosen/rejected
+    dataset = dataset.filter(
+        lambda x: bool(x.get("chosen", "").strip()) and bool(x.get("rejected", "").strip()),
+        num_proc=data_cfg.get("num_proc", 4),
+        desc="Filter empty chosen/rejected",
+    )
+
     # 3. DPO 配置
     dpo_config = DPOConfig(
         output_dir=output_dir,

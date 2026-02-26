@@ -39,14 +39,13 @@
 | `rl_trainer.py` | 仅含 `simple_empathy_reward_fn`（规则 reward 示例） | 名字易误导，实为工具函数 |
 | **PPO 核心** | | |
 | `ppo_training.py` | PPOMemory、Critic、ActorRefRollout、训练步等通用 PPO 组件 | |
-| `ppo_emo_rollout.py` | 多轮 rollout：`collect_rollouts_emo`，与 PlayerSimulator 交互 | |
+| `ppo_emo_rollout.py` | 多轮 rollout：`collect_rollouts_emo`，与 PlayerSimulatorWithPlanning 交互 | |
 | `reward_emo.py` | 三种 reward 模式（emo_point/100、trend、volatility、warmup） | |
 | **DPO rollout** | | |
 | `dpo_emo_rollout.py` | On-policy DPO 多轮 rollout：每轮 k 个回复 → 选 best/worst 造偏好对 | |
 | **用户/环境模拟** | | |
-| `hard_player_simulator_dsv3.py` | PlayerSimulator / PlayerSimulatorWithPlanning：多轮对话、emo_point 更新 | |
+| `hard_player_simulator_dsv3.py` | PlayerSimulatorWithPlanning：多轮对话、planning_reply 更新 emo_point | |
 | `qwen_user_simulator.py` | 用户回复生成（DashScope/DeepSeek 等 API） | |
-| `emo_analyzer.py` | 情感分类（emo_classifier_lora）→ change_value 更新 emo_point | |
 | `emo_planning.py` | 用 LLM planning 模板分析 NPC 回复对情绪的影响 | |
 | `local_planning_llm.py` | 本地 SFT 模型做 planning（不调 API） | |
 
@@ -75,7 +74,7 @@
   - `training/trainers/`：sft_trainer, dpo_trainer, dpo_emo_trainer, ppo_emo_trainer, grpo_training
   - `training/rollout/`：ppo_emo_rollout, dpo_emo_rollout
   - `training/reward/`：reward_emo（以及从 rl_trainer 迁入的 reward 工具）
-  - `training/simulator/`：hard_player_simulator_dsv3, qwen_user_simulator, emo_analyzer, emo_planning, local_planning_llm
+  - `training/simulator/`：hard_player_simulator_dsv3, qwen_user_simulator, emo_planning, local_planning_llm
   - `training/core/`：ppo_training（PPO 内存、Critic、Actor 等）
 
 如需我按上述方案直接改仓库（删除/移动/重命名），可以说明要做到哪一步（仅文档 / 只清理冗余 / 含 data 脚本迁移 / 含 training 子目录拆分）。

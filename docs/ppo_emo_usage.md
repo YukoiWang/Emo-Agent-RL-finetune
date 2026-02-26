@@ -3,7 +3,7 @@
 ## 概述
 
 - **数据**：`/home/yukiwang/xlwy/data/data` 下的 `train_profile.jsonl` / `test_profile.jsonl`，每行为用户形象（player、scene、task/隐藏主题）。
-- **用户模拟器**：`PlayerSimulator`（`hard_player_simulator_dsv3.py`）用外部 LLM API 当「用户」，与 Actor 多轮对话；每轮用情绪分析 API 更新 `emo_point`（0–100）。
+- **用户模拟器**：`PlayerSimulatorWithPlanning`（`hard_player_simulator_dsv3.py`）用外部 LLM API 当「用户」，与 Actor 多轮对话；每轮用 planning_reply（LLM prompt）更新 `emo_point`（0–100）。
 - **情绪分析**：`emo_classifier_lora` 微调的情感分类模型分析用户回复的积极/消极/中性，并结合 NPC 与隐藏主题贴合程度得到 `change_value`，用于更新 `emo_point`。
 - **结束条件**：用户说「再见/拜拜」或 `emo_point <= 0` 时结束对话。
 - **Reward**：为**函数**（非 reward model），支持三种模式，通过参数切换。

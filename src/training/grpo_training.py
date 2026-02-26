@@ -124,7 +124,11 @@ def run_grpo_training(
     # -- Model --
     if accelerator.is_main_process:
         print("[GRPO] 加载模型 ...")
-    dev_map = {"": accelerator.local_process_index} if accelerator.num_processes > 1 else None
+    n_visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if n_visible and accelerator.num_processes > 1 and n_visible >= accelerator.num_processes:
+        dev_map = {"": accelerator.local_process_index}
+    else:
+        dev_map = {"": 0} if torch.cuda.is_available() else None
     lora_cfg = model_cfg.get("lora") if isinstance(model_cfg.get("lora"), dict) else None
     mt: ModelAndTokenizer = load_sft_model(
         sft_model_path=model_cfg["sft_model_path"],

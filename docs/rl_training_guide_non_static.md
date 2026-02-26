@@ -49,7 +49,7 @@ Offline DPO 不在 `run_rl.py` 里，要用 `configs/rl_dpo.yaml` + 自己写一
   3. 每步对这批 profile 调用 `collect_rollouts_emo`：
      - 用 `build_initial_prompt` 得到用户开场；
      - 多轮：policy 生成回复 → `user_llm_fn` 生成用户下一句 → 直到 `max_turns` 或结束；
-     - 若 `use_planning_emo=true`，用 planning LLM 给出每步的 emo 相关信号，否则用 `emo_analyzer_fn`；
+     - 使用 planning LLM 给出每步的 emo 相关信号；
      - 用 `reward_emo`（mode1/2/3）算每条轨迹的 reward（可带 trend、volatility、warmup 等）；
      - 写入 `PPOMemory`（log_probs, ref_log_probs, values, rewards）。
   4. `memory.get(compute_gae=True)` 得到 advantages/returns，算 policy loss（clip）、value loss、KL penalty，反向传播更新 Actor + Critic。

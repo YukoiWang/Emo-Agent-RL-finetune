@@ -31,22 +31,11 @@ def build_reward_fn_emo(
     warmup_steps: int = 200,
 ) -> Callable[[List[str]], List[float]]:
     """
-    构建供单轮 PPO 使用的 reward 函数：输入 response 文本列表，输出 reward 标量列表。
-    使用 EmoAnalyzer 对回复做情感分类，将 积极/中性/消极 映射为 emo_point [0,100]。
+    构建 reward 函数：输入 response 文本列表，输出 reward 标量列表。
+    使用关键词规则映射 emo_point（用于 mock/测试，正式训练请用 planning 打分）。
     """
-    from .emo_analyzer import build_emo_analyzer
-
-    analyzer = None
-    if emo_adapter_path:
-        _device = device or ("cuda" if T.cuda.is_available() else "cpu")
-        analyzer = build_emo_analyzer(emo_adapter_path, device=_device)
-
-    SENTIMENT_TO_EMO = {0: 25.0, 1: 50.0, 2: 75.0}  # 消极、中性、积极
 
     def _emo_points_from_texts(texts: List[str]) -> List[float]:
-        if analyzer is not None:
-            preds = analyzer._predict_sentiment(texts)
-            return [SENTIMENT_TO_EMO.get(p, 50.0) for p in preds]
         positive_kw = ["理解", "感受", "谢谢", "愿意", "不容易"]
         negative_kw = ["无所谓", "不重要", "别在乎"]
         emo_points = []

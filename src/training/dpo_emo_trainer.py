@@ -81,7 +81,6 @@ def run_dpo_emo_training(cfg: Dict[str, Any]) -> None:
     ]
 
     use_planning_score = rollout_cfg.get("use_planning_score", True)
-    use_planning = rollout_cfg.get("use_planning_emo", True)
     use_mock_sim = rollout_cfg.get("use_mock_simulator", False)
     sft_model_path = rollout_cfg.get("sft_model_path") or model_cfg.get("sft_model_path")
     target = rollout_cfg.get("target", "eq")
@@ -123,29 +122,15 @@ def run_dpo_emo_training(cfg: Dict[str, Any]) -> None:
     def build_user_sim(profile: Dict[str, Any]):
         if use_mock_sim:
             return _MockUserSimulator()
-        if use_planning:
-            from src.training.hard_player_simulator_dsv3 import build_player_simulator_with_planning
-            return build_player_simulator_with_planning(
-                profile=profile,
-                sft_model_path=sft_model_path,
-                target=rollout_cfg.get("target", "eq"),
-                initial_emo_point=50.0,
-                api_key=os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("DASHSCOPE_API_KEY"),
-                model=rollout_cfg.get("user_model", "deepseek-chat"),
-            )
-        else:
-            from src.training.hard_player_simulator_dsv3 import PlayerSimulator
-            from src.training.emo_analyzer import build_emo_analyzer, emo_analyzer_fn_from_analyzer
-            adapter = emo_cfg.get("emo_adapter_path")
-            if not adapter:
-                raise ValueError("use_planning_emo=False 时需配置 reward.emo_adapter_path")
-            analyzer = build_emo_analyzer(adapter)
-            from src.training.qwen_user_simulator import build_qwen_user_llm_fn
-            user_llm = build_qwen_user_llm_fn()
-            return PlayerSimulator(
-                profile, user_llm, emo_analyzer_fn_from_analyzer(analyzer),
-                initial_emo_point=50.0,
-            )
+        from src.training.hard_player_simulator_dsv3 import build_player_simulator_with_planning
+        return build_player_simulator_with_planning(
+            profile=profile,
+            sft_model_path=sft_model_path,
+            target=rollout_cfg.get("target", "eq"),
+            initial_emo_point=50.0,
+            api_key=os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("DASHSCOPE_API_KEY"),
+            model=rollout_cfg.get("user_model", "deepseek-chat"),
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     lora_cfg = model_cfg.get("lora") if isinstance(model_cfg.get("lora"), dict) else None

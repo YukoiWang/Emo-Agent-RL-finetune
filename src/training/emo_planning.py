@@ -252,10 +252,9 @@ def build_planning_emo_analyzer_fn(
     target_prompt: str = "eq",
 ) -> Callable[..., Dict[str, Any]]:
     """
-    构建兼容 emo_analyzer_fn 接口的 planning 版本。
-    注意：标准接口是 (npc_reply, user_reply, hidden_theme)，但 planning 需要 profile/dialog/emo_point。
-    本函数返回一个需要 (profile, dialog, emo_point) 的 callable，供 PlayerSimulatorWithPlanning 使用。
-    返回格式与 emo_analyzer_fn 一致：{change_value, sentiment?, theme_fit?, planning?}
+    构建 planning 版情感分析接口。
+    输入 (profile, dialog, emo_point)，返回 {change_value, planning}。
+    供需要 planning 风格接口的代码使用（PlayerSimulatorWithPlanning 内部直接调 planning_reply）。
     """
 
     def fn(

@@ -146,7 +146,6 @@ def run_emotion_metrics(
     tokenizer,
     profile_data_path: str,
     device: str,
-    emo_analyzer_fn=None,
     user_llm_fn=None,
     max_turns: int = 10,
     max_new_tokens: int = 128,

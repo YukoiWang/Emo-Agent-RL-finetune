@@ -144,7 +144,6 @@ def main():
             critic=critic,
             tokenizer=tokenizer,
             user_llm_fn=user_llm_fn,
-            emo_analyzer_fn=None,
             memory=memory,
             get_ref_log_probs_fn=get_ref_log_probs_fn,
             device=device,
@@ -154,7 +153,6 @@ def main():
             do_sample=True,
             temperature=0.8,
             top_p=0.95,
-            use_planning_emo=True,
             target="eq",
         )
         print(f"  Rollout 完成 ({time.time()-t0:.1f}s)")
