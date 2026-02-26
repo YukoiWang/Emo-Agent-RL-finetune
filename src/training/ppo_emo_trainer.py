@@ -149,8 +149,11 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         device=device,
     )
     hidden_size = mt.model.config.hidden_size
-    # Critic 复用 Ref backbone，不再加载第三份模型，节省 ~20GB 显存
-    critic = Critic(actor_ref.ref, hidden_size, dropout=0.0).to(device)
+    # Critic 使用独立 backbone，不与 ref 共享
+    critic_base = copy.deepcopy(mt.model)
+    if rl_cfg.get("gradient_checkpointing", False) and hasattr(critic_base, "gradient_checkpointing_enable"):
+        critic_base.gradient_checkpointing_enable()
+    critic = Critic(critic_base, hidden_size, dropout=0.0).to(device)
 
     # ---------- 2. 数据 ----------
     dataset = ProfileDataset(
