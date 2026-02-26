@@ -14,13 +14,15 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
+import traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
 
@@ -60,6 +62,8 @@ def create_app(model_path: str, device: str = "cuda", dtype: str = "bfloat16"):
     model = model.to(device)
     model.eval()
 
+    _infer_lock = threading.Lock()
+
     @app.post("/generate", response_model=GenerateResponse)
     def generate(req: GenerateRequest) -> GenerateResponse:
         if not req.messages:
@@ -68,27 +72,32 @@ def create_app(model_path: str, device: str = "cuda", dtype: str = "bfloat16"):
         content = messages[-1].get("content", "") if messages else ""
         if not content:
             return GenerateResponse(text="")
-        if hasattr(tokenizer, "apply_chat_template"):
-            text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        else:
-            text = f"<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096)
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-        with torch.no_grad():
-            out = model.generate(
-                **inputs,
-                max_new_tokens=req.max_new_tokens,
-                do_sample=req.do_sample,
-                temperature=req.temperature,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        gen = out[0][inputs["input_ids"].shape[1]:]
-        resp_text = tokenizer.decode(gen, skip_special_tokens=True).strip()
-        return GenerateResponse(text=resp_text)
+        try:
+            if hasattr(tokenizer, "apply_chat_template"):
+                text = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            else:
+                text = f"<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
+            with _infer_lock:
+                inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=4096)
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+                with torch.no_grad():
+                    out = model.generate(
+                        **inputs,
+                        max_new_tokens=req.max_new_tokens,
+                        do_sample=req.do_sample,
+                        temperature=req.temperature,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                gen = out[0][inputs["input_ids"].shape[1]:]
+                resp_text = tokenizer.decode(gen, skip_special_tokens=True).strip()
+            return GenerateResponse(text=resp_text)
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/health")
     def health():

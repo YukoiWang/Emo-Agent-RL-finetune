@@ -327,9 +327,20 @@ class ActorRefRollout(nn.Module):
         """
         outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
         logits = outputs.logits  # (batch, seq_len, vocab_size)
-        log_probs_next = F.log_softmax(logits[:, :-1, :], dim=-1)  # (batch, seq_len-1, vocab_size)
-        target_ids = input_ids[:, 1:].unsqueeze(-1)  # (batch, seq_len-1, 1)
-        token_log_probs = log_probs_next.gather(dim=-1, index=target_ids).squeeze(-1)  # (batch, seq_len-1)
+        del outputs
+
+        # Use cross_entropy to avoid materializing full (batch, seq-1, vocab) log_softmax
+        shift_logits = logits[:, :-1, :].contiguous()
+        del logits
+        shift_labels = input_ids[:, 1:].contiguous()
+        batch_size, seq_minus1, vocab = shift_logits.shape
+        token_log_probs = -F.cross_entropy(
+            shift_logits.view(-1, vocab),
+            shift_labels.view(-1),
+            reduction="none",
+        ).view(batch_size, seq_minus1)
+        del shift_logits, shift_labels
+
         full_len = input_ids.size(1)
         full_log_probs = T.zeros(
             input_ids.size(0), full_len,
@@ -367,6 +378,7 @@ class ActorRefRollout(nn.Module):
         log_probs = self._log_probs_from_model(self.ref, input_ids, attention_mask, response_mask)
         return log_probs
 
+    @T.no_grad()
     def generate(
         self,
         query_ids: T.Tensor,
@@ -390,8 +402,8 @@ class ActorRefRollout(nn.Module):
             temperature=temperature if do_sample else 1.0,
             pad_token_id=pad_token_id,
         )
-        # HF generate returns tensor or .sequences
         generated = gen_outputs.sequences if hasattr(gen_outputs, "sequences") else gen_outputs
+        del gen_outputs
         query_len = query_ids.size(1)
         full_ids = generated
         response_ids = full_ids[:, query_len:]
