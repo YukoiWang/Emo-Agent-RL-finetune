@@ -170,8 +170,16 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
 
     # ---------- 3. 用户模拟与情感（使用 planning_reply） ----------
     user_llm_fn = _build_user_llm_fn(cfg)
-    planning_llm_fn = None
+    planning_service_url = rollout_cfg.get("planning_service_url")
     sft_model_path = model_cfg.get("sft_model_path")
+    if planning_service_url:
+        from src.training.planning_service_client import build_planning_service_llm_fn
+        planning_llm_fn = build_planning_service_llm_fn(planning_service_url)
+    elif sft_model_path:
+        from src.training.local_planning_llm import build_local_planning_llm_fn
+        planning_llm_fn = build_local_planning_llm_fn(sft_model_path, device=device)
+    else:
+        planning_llm_fn = None
     target_default = rollout_cfg.get("target", "eq")
 
     # ---------- 4. Memory / ref_log_probs / optimizer ----------

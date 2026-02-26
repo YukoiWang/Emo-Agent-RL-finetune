@@ -82,11 +82,16 @@ def run_dpo_emo_training(cfg: Dict[str, Any]) -> None:
 
     use_planning_score = rollout_cfg.get("use_planning_score", True)
     use_mock_sim = rollout_cfg.get("use_mock_simulator", False)
+    planning_service_url = rollout_cfg.get("planning_service_url")
     sft_model_path = rollout_cfg.get("sft_model_path") or model_cfg.get("sft_model_path")
     target = rollout_cfg.get("target", "eq")
+    planning_llm_fn = None
 
     if use_planning_score and not use_mock_sim:
-        if sft_model_path:
+        if planning_service_url:
+            from src.training.planning_service_client import build_planning_service_llm_fn
+            planning_llm_fn = build_planning_service_llm_fn(planning_service_url)
+        elif sft_model_path:
             from src.training.local_planning_llm import build_local_planning_llm_fn
             planning_llm_fn = build_local_planning_llm_fn(sft_model_path)
         else:
@@ -125,7 +130,8 @@ def run_dpo_emo_training(cfg: Dict[str, Any]) -> None:
         from src.training.hard_player_simulator_dsv3 import build_player_simulator_with_planning
         return build_player_simulator_with_planning(
             profile=profile,
-            sft_model_path=sft_model_path,
+            planning_llm_fn=planning_llm_fn if use_planning_score and not use_mock_sim else None,
+            sft_model_path=sft_model_path if not planning_service_url else None,
             target=rollout_cfg.get("target", "eq"),
             initial_emo_point=50.0,
             api_key=os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("DASHSCOPE_API_KEY"),

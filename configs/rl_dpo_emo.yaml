@@ -32,6 +32,7 @@ rollout:
   use_planning_score: true  # 用 emo_planning 打分（考虑 profile、上下文、隐藏主题）；false 则用 reward_emo
   use_mock_simulator: false  # true 时用简单 mock，无需 API，便于本地测试
   sft_model_path: null   # planning 用本地 SFT 时指定（打分和用户模拟器共用）
+  planning_service_url: null  # 独立 planning 服务地址，如 "http://localhost:8765"，优先于 sft_model_path
   target: "eq"
   user_model: "deepseek-chat"  # 用户模拟器调用的 API 模型
   planning_model: "deepseek-chat"  # planning 打分用 API 时的模型（sft_model_path 为空时）

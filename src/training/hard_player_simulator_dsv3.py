@@ -291,7 +291,7 @@ def build_player_simulator_with_planning(
         player_llm_fn = build_qwen_user_llm_fn(api_key=api_key, model=model)
     else:
         player_llm_fn = player_llm_fn or llm_fn
-    if sft_model_path:
+    if planning_llm_fn is None and sft_model_path:
         from .local_planning_llm import build_local_planning_llm_fn
         planning_llm_fn = build_local_planning_llm_fn(sft_model_path, device=device)
     return PlayerSimulatorWithPlanning(

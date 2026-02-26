@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Union
 
 import torch
-
+import os
 
 def build_local_planning_llm_fn(
     model_path: str,
@@ -25,22 +25,47 @@ def build_local_planning_llm_fn(
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    _dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}.get(dtype, torch.bfloat16)
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    # _dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}.get(dtype, torch.bfloat16)
+    # device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
+    # tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    # if tokenizer.pad_token is None:
+    #     tokenizer.pad_token = tokenizer.eos_token
+
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     model_path,
+    #     torch_dtype=_dtype,
+    #     device_map="auto" if "cuda" in str(device) else None,
+    #     trust_remote_code=True,
+    # )
+    # if "cuda" not in str(device) and hasattr(model, "to"):
+    #     model = model.to(device)
+    # model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=_dtype,
-        device_map="auto" if "cuda" in str(device) else None,
-        trust_remote_code=True,
-    )
-    if "cuda" not in str(device) and hasattr(model, "to"):
+    model = None
+
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if rank == 0:
+        _dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16}.get(dtype, torch.bfloat16)
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=_dtype,
+            trust_remote_code=True,
+        )
+
         model = model.to(device)
-    model.eval()
+        model.eval()
+
+        if world_size > 1 and torch.distributed.is_initialized():
+            for param in model.parameters():
+                torch.distributed.broadcast(param.data, src=0)
 
     def fn(messages: List[Dict[str, str]]) -> str:
         if not messages:

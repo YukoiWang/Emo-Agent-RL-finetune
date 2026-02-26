@@ -19,6 +19,7 @@ rollout:
   max_turns: 8
   max_new_tokens_per_turn: 128
   use_planning_emo: true
+  planning_service_url: null  # 如 "http://localhost:8765"，优先于 sft_model_path
   user_llm: "mock"
   target: "eq"
   temperature: 0.8
