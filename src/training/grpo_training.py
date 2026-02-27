@@ -614,8 +614,17 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
         )
     accelerator.wait_for_everyone()
 
-    log_path = os.path.join(output_dir, "training_log.jsonl")
-    log_file = open(log_path, "w", encoding="utf-8") if accelerator.is_main_process else None
+    from .monitor import TrainingMonitor
+    monitor_cfg = cfg.get("monitor", {}) or {}
+    monitor = TrainingMonitor(
+        output_dir=output_dir,
+        experiment_name=monitor_cfg.get("experiment_name", "grpo_emo"),
+        use_tensorboard=monitor_cfg.get("use_tensorboard", True),
+        use_wandb=monitor_cfg.get("use_wandb", False),
+        wandb_project=monitor_cfg.get("wandb_project"),
+        config=cfg,
+        enabled=accelerator.is_main_process,
+    )
 
     data_iter = iter(dataloader)
     global_step = 0
@@ -707,16 +716,13 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
         total_loss_acc += step_loss_val
         total_reward_acc += r_mean.item()
 
-        if accelerator.is_main_process and log_file is not None:
-            log_record = {
-                "step": global_step,
-                "reward_mean": r_mean.item(),
-                "rewards": rewards,
-                "loss": step_loss_val,
-                "kl_loss": step_kl_val / max(valid_count, 1),
-            }
-            log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
-            log_file.flush()
+        monitor.log(step=global_step, metrics={
+            "reward_mean": r_mean.item(),
+            "rewards_max": max(rewards),
+            "rewards_min": min(rewards),
+            "loss": step_loss_val,
+            "kl_loss": step_kl_val / max(valid_count, 1),
+        })
 
         global_step += 1
 
@@ -744,12 +750,12 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
                 while len(ckpts) > save_total_limit:
                     shutil.rmtree(ckpts.pop(0), ignore_errors=True)
 
-    if log_file is not None:
-        log_file.close()
+    monitor.close()
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unwrapped = accelerator.unwrap_model(actor)
         final_dir = os.path.join(output_dir, "final")
         unwrapped.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)
+        log_path = os.path.join(output_dir, "training_log.jsonl")
         print(f"[GRPO-Emo] 训练完成，模型已保存到 {final_dir}，指标日志: {log_path}")
