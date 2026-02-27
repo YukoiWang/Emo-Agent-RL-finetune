@@ -30,7 +30,7 @@ class TrainingMonitor:
         output_dir: str,
         experiment_name: str = "train",
         use_tensorboard: bool = True,
-        use_wandb: bool = False,
+        use_wandb: bool = True,
         wandb_project: Optional[str] = None,
         wandb_entity: Optional[str] = None,
         wandb_run_name: Optional[str] = None,

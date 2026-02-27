@@ -44,9 +44,9 @@ reward:
 
 monitor:
   use_tensorboard: true
-  use_wandb: false
+  use_wandb: true
+  wandb_project: "emo-rl"
   experiment_name: "grpo_emo"
-  # wandb_project: "emo-rl"    # uncomment to enable wandb
 
 training:
   output_dir: "outputs/grpo_emo"
