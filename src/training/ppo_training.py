@@ -12,6 +12,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union, Callable
 
+try:
+    from peft import PeftModel
+except ImportError:
+    PeftModel = None
+
 
 class PPOMemory:
     """
@@ -50,14 +55,14 @@ class PPOMemory:
         ref_log_probs: T.Tensor,
     ) -> None:
         """Store one rollout (can be a whole batch or per-item)."""
-        self.queries.append(query_ids.detach().to(self.device))
-        self.query_masks.append(query_mask.detach().to(self.device))
-        self.responses.append(response_ids.detach().to(self.device))
-        self.response_masks.append(response_mask.detach().to(self.device))
-        self.log_probs.append(log_probs.detach().to(self.device))
-        self.values.append(values.detach().to(self.device))
+        self.queries.append(query_ids.detach().cpu()) 
+        self.query_masks.append(query_mask.detach().cpu())
+        self.responses.append(response_ids.detach().cpu())
+        self.response_masks.append(response_mask.detach().cpu())
+        self.log_probs.append(log_probs.detach().cpu())
+        self.values.append(values.detach().cpu())
         self.rewards.append(float(reward))
-        self.ref_log_probs.append(ref_log_probs.detach().to(self.device))
+        self.ref_log_probs.append(ref_log_probs.detach().cpu())
 
     def store_batch(
         self,
@@ -157,6 +162,24 @@ class PPOMemory:
             out["returns"] = returns
         return out
 
+    # def sample(
+    #     self,
+    #     mini_batch_size: Optional[int] = None,
+    #     compute_gae: bool = True,
+    #     last_value: Optional[T.Tensor] = None,
+    # ) -> dict:
+    #     """
+    #     Same as get(); if mini_batch_size given, randomly sample a mini-batch.
+    #     If not given, returns all (equivalent to get()).
+    #     """
+    #     full = self.get(compute_gae=compute_gae, last_value=last_value)
+    #     if mini_batch_size is None or mini_batch_size >= len(self):
+    #         return full
+    #     indices = T.randperm(len(self), device=self.device)[:mini_batch_size].tolist()
+    #     return {
+    #         k: [v[i] for i in indices] if isinstance(v, list) else v
+    #         for k, v in full.items()
+    #     }
     def sample(
         self,
         mini_batch_size: Optional[int] = None,
@@ -164,18 +187,17 @@ class PPOMemory:
         last_value: Optional[T.Tensor] = None,
     ) -> dict:
         """
-        Same as get(); if mini_batch_size given, randomly sample a mini-batch.
-        If not given, returns all (equivalent to get()).
+        Sample a mini-batch from buffer. Data stays on CPU;
+        caller is responsible for .to(device) via _pad_list_to_tensor / _build_full_sequence_batch.
         """
         full = self.get(compute_gae=compute_gae, last_value=last_value)
-        if mini_batch_size is None or mini_batch_size >= len(self):
-            return full
-        indices = T.randperm(len(self), device=self.device)[:mini_batch_size].tolist()
-        return {
-            k: [v[i] for i in indices] if isinstance(v, list) else v
-            for k, v in full.items()
-        }
-
+        if mini_batch_size is not None and mini_batch_size < len(self):
+            indices = T.randperm(len(self))[:mini_batch_size].tolist()
+            return {
+                k: [v[i] for i in indices] if isinstance(v, list) else v
+                for k, v in full.items()
+            }
+        return full
 
 # ---------------------------------------------------------------------------
 # Critic: value head, maps hidden states to value per position
@@ -289,16 +311,23 @@ class ActorRefRollout(nn.Module):
         super().__init__()
         # actor, ref (frozen copy), tokenizer, ref_sync_interval, device, _step
         self.actor = causal_lm
-        self.ref = copy.deepcopy(causal_lm)
-        for param in self.ref.parameters():
-            param.requires_grad = False
         self.tokenizer = tokenizer
         self.ref_sync_interval = ref_sync_interval
         self.device = device or next(causal_lm.parameters()).device
         self._step = 0
+        self.is_peft = PeftModel is not None and isinstance(self.actor, PeftModel)
+        if self.is_peft:
+            self.ref = None
+        else:
+            print("Warning: Not using PEFT model. High memory usage warning (Copying Ref Model).")
+            self.ref = copy.deepcopy(causal_lm)
+            for param in self.ref.parameters():
+                param.requires_grad = False
 
     def sync_ref_from_actor(self) -> None:
         """Sync ref params from current actor (optional periodic ref update)."""
+        if self.is_peft:
+            return
         state_dict = copy.deepcopy(self.actor.state_dict())
         self.ref.load_state_dict(state_dict)
         for param in self.ref.parameters():
@@ -306,7 +335,7 @@ class ActorRefRollout(nn.Module):
 
     def maybe_sync_ref(self) -> None:
         """Sync ref when ref_sync_interval steps reached."""
-        if self.ref_sync_interval is None:
+        if self.ref_sync_interval is None or self.is_peft:
             return
         self._step += 1
         if self._step % self.ref_sync_interval == 0:
@@ -319,6 +348,7 @@ class ActorRefRollout(nn.Module):
         input_ids: T.Tensor,
         attention_mask: T.Tensor,
         response_mask: T.Tensor,
+        _chunk: int = 256,
     ) -> T.Tensor:
         """
         Compute response-position token log_probs from causal LM.
@@ -329,25 +359,42 @@ class ActorRefRollout(nn.Module):
         logits = outputs.logits  # (batch, seq_len, vocab_size)
         del outputs
 
-        # Use cross_entropy to avoid materializing full (batch, seq-1, vocab) log_softmax
-        shift_logits = logits[:, :-1, :].contiguous()
-        del logits
-        shift_labels = input_ids[:, 1:].contiguous()
-        batch_size, seq_minus1, vocab = shift_logits.shape
-        token_log_probs = -F.cross_entropy(
-            shift_logits.view(-1, vocab),
-            shift_labels.view(-1),
-            reduction="none",
-        ).view(batch_size, seq_minus1)
-        del shift_logits, shift_labels
+        batch_size, seq_len, vocab = logits.shape
+        seq_m1 = seq_len - 1
+        shift_labels = input_ids[:, 1:]
+        token_log_probs = T.zeros(batch_size, seq_m1, dtype=logits.dtype, device=logits.device)
+
+        for start in range(0, seq_m1, _chunk):
+            end = min(start + _chunk, seq_m1)
+            chunk_logits = logits[:, start:end, :].contiguous()
+            chunk_labels = shift_labels[:, start:end].contiguous()
+            token_log_probs[:, start:end] = -F.cross_entropy(
+                chunk_logits.view(-1, vocab),
+                chunk_labels.view(-1),
+                reduction="none",
+            ).view(batch_size, end - start)
+            del chunk_logits, chunk_labels
+        del logits, shift_labels
 
         full_len = input_ids.size(1)
         full_log_probs = T.zeros(
-            input_ids.size(0), full_len,
+            batch_size, full_len,
             dtype=token_log_probs.dtype, device=token_log_probs.device,
         )
         full_log_probs[:, 1:] = token_log_probs
         return full_log_probs * response_mask
+
+    def forward(
+        self,
+        input_ids: T.Tensor,
+        attention_mask: T.Tensor,
+        response_mask: T.Tensor,
+    ) -> T.Tensor:
+        """
+        DDP-compatible forward: computes actor log_probs for the response part.
+        Call this through the DDP wrapper during training so gradient sync hooks fire.
+        """
+        return self._log_probs_from_model(self.actor, input_ids, attention_mask, response_mask)
 
     def get_actor_log_probs(
         self,
@@ -361,6 +408,9 @@ class ActorRefRollout(nn.Module):
         attention_mask: (batch, full_len)
         response_mask: (batch, full_len), 1 at response positions
         Returns: (batch, full_len), only response positions valid.
+
+        NOTE: For training under DDP, prefer calling forward() (i.e. module(...))
+        so that gradient synchronization hooks fire correctly.
         """
         log_probs = self._log_probs_from_model(self.actor, input_ids, attention_mask, response_mask)
         return log_probs
@@ -375,8 +425,15 @@ class ActorRefRollout(nn.Module):
         Get ref log_probs for response part.
         Same shape convention as get_actor_log_probs.
         """
-        log_probs = self._log_probs_from_model(self.ref, input_ids, attention_mask, response_mask)
-        return log_probs
+        # log_probs = self._log_probs_from_model(self.ref, input_ids, attention_mask, response_mask)
+        # return log_probs
+        with T.no_grad():
+            if self.is_peft:
+                # 【关键修改】：临时禁用 LoRA，基座模型即为 Ref Model
+                with self.actor.disable_adapter():
+                    return self._log_probs_from_model(self.actor, input_ids, attention_mask, response_mask)
+            else:
+                return self._log_probs_from_model(self.ref, input_ids, attention_mask, response_mask)
 
     @T.no_grad()
     def generate(

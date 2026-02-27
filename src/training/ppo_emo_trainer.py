@@ -12,6 +12,7 @@ import copy
 import glob
 import json
 import os
+import random
 import shutil
 import time
 from pathlib import Path
@@ -151,6 +152,7 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
     hidden_size = mt.model.config.hidden_size
     # Critic 使用独立 backbone，不与 ref 共享
     critic_base = copy.deepcopy(mt.model)
+    critic_base.config.use_cache = False 
     if rl_cfg.get("gradient_checkpointing", False) and hasattr(critic_base, "gradient_checkpointing_enable"):
         critic_base.gradient_checkpointing_enable()
     critic = Critic(critic_base, hidden_size, dropout=0.0).to(device)
@@ -185,7 +187,7 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
     # ---------- 4. Memory / ref_log_probs / optimizer ----------
     gamma = rl_cfg.get("gamma", 1.0)
     lam = rl_cfg.get("lam", 0.95)
-    memory = PPOMemory(gamma=gamma, lam=lam, device=device)
+    memory = PPOMemory(gamma=gamma, lam=lam, device="cpu")
 
     def get_ref_log_probs_fn(q_ids, q_mask, r_ids, r_mask):
         q_len = q_ids.size(1)
@@ -195,7 +197,8 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         full_attn[:, q_len:] = r_mask.to(T.float32)
         full_resp_mask = T.zeros_like(full_ids, dtype=T.float32, device=device)
         full_resp_mask[:, q_len:] = r_mask.to(T.float32)
-        full_lp = actor_ref.get_ref_log_probs(full_ids, full_attn, full_resp_mask)
+        unwrapped = accelerator.unwrap_model(actor_ref)
+        full_lp = unwrapped.get_ref_log_probs(full_ids, full_attn, full_resp_mask)
         return full_lp[:, q_len:]
 
     lr = rl_cfg.get("learning_rate", 1e-6)
@@ -295,80 +298,118 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
             continue
 
         data = memory.get(compute_gae=True)
-        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-        queries = data["queries"]
-        responses = data["responses"]
-        qlens = [q.size(0) for q in queries]
-        resp_lens = [r.size(0) for r in responses]
-        full_seqs = [T.cat([q, r], dim=0) for q, r in zip(queries, responses)]
-        max_len = max(s.size(0) for s in full_seqs)
-        n_batch = len(full_seqs)
 
-        full_ids = T.full((n_batch, max_len), pad_id, dtype=T.long, device=device)
-        full_attn = T.zeros(n_batch, max_len, dtype=T.float32, device=device)
-        full_resp_mask = T.zeros(n_batch, max_len, dtype=T.float32, device=device)
-        for i, seq in enumerate(full_seqs):
-            L = seq.size(0)
-            full_ids[i, :L] = seq.to(device)
-            qlen, rlen = qlens[i], resp_lens[i]
-            full_attn[i, :qlen] = data["query_masks"][i].to(T.float32).to(device)
-            full_attn[i, qlen : qlen + rlen] = data["response_masks"][i].to(T.float32).to(device)
-            full_resp_mask[i, qlen : qlen + rlen] = data["response_masks"][i].to(T.float32).to(device)
-
-        new_log_probs = actor_ref.get_actor_log_probs(full_ids, full_attn, full_resp_mask)
-        values = critic(full_ids, full_attn)
-
-        old_log_probs, _ = _pad_list_to_tensor(data["log_probs"], 0.0, device)
-        ref_log_probs, _ = _pad_list_to_tensor(data["ref_log_probs"], 0.0, device)
-        advantages, adv_mask = _pad_list_to_tensor(data["advantages"], 0.0, device)
-        returns, ret_mask = _pad_list_to_tensor(data["returns"], 0.0, device)
-        resp_mask_padded, _ = _pad_list_to_tensor(data["response_masks"], 0.0, device)
-        n_valid = resp_mask_padded.sum().clamp(min=1e-8)
-
-        max_r = max(resp_lens)
-        new_lp_resp = T.zeros(n_batch, max_r, dtype=T.float32, device=device)
-        values_resp = T.zeros(n_batch, max_r, dtype=T.float32, device=device)
-        for i in range(n_batch):
-            s, rlen = qlens[i], resp_lens[i]
-            new_lp_resp[i, :rlen] = new_log_probs[i, s : s + rlen]
-            values_resp[i, :rlen] = values[i, s : s + rlen]
-
+        ppo_epochs = rl_cfg.get("ppo_epochs", 2)
+        mini_batch_size = rl_cfg.get("mini_batch_size", 1)
         clip_range = rl_cfg.get("clip_range", 0.2)
-        ratio = T.exp(new_lp_resp - old_log_probs)
-        surr1 = ratio * advantages
-        surr2 = T.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
-        policy_loss = -(T.minimum(surr1, surr2) * adv_mask).sum() / n_valid
-        value_loss = ((values_resp - returns) ** 2 * ret_mask).sum() / n_valid
         kl_coef = rl_cfg.get("kl_penalty_coef", 0.02)
-        kl_loss = ((old_log_probs - ref_log_probs) * adv_mask).sum() / n_valid
-        total_loss = policy_loss + 0.5 * value_loss + kl_coef * kl_loss
 
-        optimizer.zero_grad()
-        total_loss.backward()
-        T.nn.utils.clip_grad_norm_(
-            list(actor_ref.parameters_for_optimizer()) + list(critic.parameters()),
-            1.0,
-        )
-        optimizer.step()
+        total_buffer_size = len(data["queries"])
+        indices = list(range(total_buffer_size))
+        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
+        all_stats: list[dict[str, float]] = []
+
+        for _epoch in range(ppo_epochs):
+            random.shuffle(indices)
+
+            for i in range(0, total_buffer_size, mini_batch_size):
+                batch_indices = indices[i : i + mini_batch_size]
+                if not batch_indices:
+                    continue
+
+                queries = [data["queries"][idx] for idx in batch_indices]
+                responses = [data["responses"][idx] for idx in batch_indices]
+                query_masks = [data["query_masks"][idx] for idx in batch_indices]
+                response_masks = [data["response_masks"][idx] for idx in batch_indices]
+
+                old_log_probs_list = [data["log_probs"][idx] for idx in batch_indices]
+                ref_log_probs_list = [data["ref_log_probs"][idx] for idx in batch_indices]
+                advantages_list = [data["advantages"][idx] for idx in batch_indices]
+                returns_list = [data["returns"][idx] for idx in batch_indices]
+
+                qlens = [q.size(0) for q in queries]
+                resp_lens = [r.size(0) for r in responses]
+                full_seqs = [T.cat([q, r], dim=0) for q, r in zip(queries, responses)]
+                max_len = max(s.size(0) for s in full_seqs)
+                curr_bs = len(full_seqs)
+
+                full_ids = T.full((curr_bs, max_len), pad_id, dtype=T.long, device=device)
+                full_attn = T.zeros(curr_bs, max_len, dtype=T.float32, device=device)
+                full_resp_mask = T.zeros(curr_bs, max_len, dtype=T.float32, device=device)
+
+                for j, seq in enumerate(full_seqs):
+                    L = seq.size(0)
+                    full_ids[j, :L] = seq.to(device)
+                    qlen, rlen = qlens[j], resp_lens[j]
+                    full_attn[j, :qlen] = query_masks[j].to(T.float32).to(device)
+                    full_attn[j, qlen : qlen + rlen] = response_masks[j].to(T.float32).to(device)
+                    full_resp_mask[j, qlen : qlen + rlen] = response_masks[j].to(T.float32).to(device)
+
+                new_log_probs = actor_ref(full_ids, full_attn, full_resp_mask)
+                values = critic(full_ids, full_attn)
+
+                old_log_probs, _ = _pad_list_to_tensor(old_log_probs_list, 0.0, device)
+                ref_log_probs, _ = _pad_list_to_tensor(ref_log_probs_list, 0.0, device)
+                advantages, adv_mask = _pad_list_to_tensor(advantages_list, 0.0, device)
+                returns, ret_mask = _pad_list_to_tensor(returns_list, 0.0, device)
+
+                max_r = max(resp_lens)
+                new_lp_resp = T.zeros(curr_bs, max_r, dtype=T.float32, device=device)
+                values_resp = T.zeros(curr_bs, max_r, dtype=T.float32, device=device)
+
+                for j in range(curr_bs):
+                    s, rlen = qlens[j], resp_lens[j]
+                    new_lp_resp[j, :rlen] = new_log_probs[j, s : s + rlen]
+                    values_resp[j, :rlen] = values[j, s : s + rlen]
+
+                ratio = T.exp(new_lp_resp - old_log_probs)
+                surr1 = ratio * advantages
+                surr2 = T.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
+
+                valid_count = adv_mask.sum().clamp(min=1e-8)
+
+                policy_loss = -(T.minimum(surr1, surr2) * adv_mask).sum() / valid_count
+                value_loss = ((values_resp - returns) ** 2 * ret_mask).sum() / valid_count
+                kl_loss = ((old_log_probs - ref_log_probs) * adv_mask).sum() / valid_count
+                total_loss = policy_loss + 0.5 * value_loss + kl_coef * kl_loss
+
+                all_stats.append({
+                    "policy_loss": policy_loss.item(),
+                    "value_loss": value_loss.item(),
+                    "kl_loss": kl_loss.item(),
+                    "total_loss": total_loss.item(),
+                })
+
+                optimizer.zero_grad()
+                accelerator.backward(total_loss)
+                T.nn.utils.clip_grad_norm_(
+                    list(accelerator.unwrap_model(actor_ref).parameters_for_optimizer()) + list(critic.parameters()),
+                    1.0,
+                )
+                optimizer.step()
+
+                del full_ids, full_attn, full_resp_mask, new_log_probs, values, total_loss
+
+        if T.cuda.is_available():
+            T.cuda.empty_cache()
         memory.clear()
 
+        avg_stats = {k: sum(s[k] for s in all_stats) / len(all_stats) for k in all_stats[0]} if all_stats else {}
         reward_mean = sum(data["rewards"]) / len(data["rewards"]) if data["rewards"] else 0.0
         elapsed = time.time() - start_time
         if accelerator.is_main_process and (global_step + 1) % logging_steps == 0:
             print(
                 f"  step={global_step + 1}/{total_steps} | reward_mean={reward_mean:.4f} | "
-                f"policy_loss={policy_loss.item():.4f} value_loss={value_loss.item():.4f} "
-                f"kl_loss={kl_loss.item():.4f} | {elapsed:.0f}s"
+                f"policy_loss={avg_stats.get('policy_loss', 0):.4f} "
+                f"value_loss={avg_stats.get('value_loss', 0):.4f} "
+                f"kl_loss={avg_stats.get('kl_loss', 0):.4f} | {elapsed:.0f}s"
             )
         if accelerator.is_main_process and log_file is not None:
             log_record = {
                 "step": global_step,
                 "reward_mean": reward_mean,
-                "policy_loss": policy_loss.item(),
-                "value_loss": value_loss.item(),
-                "kl_loss": kl_loss.item(),
-                "total_loss": total_loss.item(),
+                **avg_stats,
                 "elapsed": elapsed,
             }
             log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
