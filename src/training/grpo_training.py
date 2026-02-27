@@ -14,6 +14,7 @@ GRPO (Group Relative Policy Optimization) 训练模块。
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import glob as glob_mod
 import json
@@ -681,7 +682,9 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
         advantages = (rewards_t - r_mean) / r_std
 
         # --- 6c. Policy update (gradient accumulation over G dialogues) ---
-        actor_unwrapped.train()
+        # Use the DDP-wrapped `actor` (not unwrapped) so that gradient
+        # allreduce fires correctly on multi-GPU setups.
+        actor.train()
         optimizer.zero_grad()
         step_loss_val = 0.0
         step_kl_val = 0.0
@@ -689,25 +692,30 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
         for i, (full_ids, full_mask, resp_mask, _, _) in enumerate(rollout_results):
             n_resp = resp_mask.sum().clamp(min=1)
 
-            actor_lp = _masked_log_probs(actor_unwrapped, full_ids, full_mask, resp_mask)
-            with torch.no_grad():
-                ref_lp = _masked_log_probs(ref_model, full_ids, full_mask, resp_mask)
-                old_lp = actor_lp.detach()
+            # Suppress DDP allreduce on non-last iterations (saves bandwidth)
+            is_last = (i == valid_count - 1)
+            sync_ctx = contextlib.nullcontext() if is_last else accelerator.no_sync(actor)
 
-            ratio = torch.exp(actor_lp - old_lp)
-            adv = advantages[i]
-            surr1 = ratio * adv
-            surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * adv
-            pg_loss = -(torch.minimum(surr1, surr2) * resp_mask).sum() / n_resp
-            kl = ((old_lp - ref_lp) * resp_mask).sum() / n_resp
+            with sync_ctx:
+                actor_lp = _masked_log_probs(actor, full_ids, full_mask, resp_mask)
+                with torch.no_grad():
+                    ref_lp = _masked_log_probs(ref_model, full_ids, full_mask, resp_mask)
+                    old_lp = actor_lp.detach()
 
-            loss_i = (pg_loss + kl_coef * kl) / valid_count
-            loss_i.backward()
+                ratio = torch.exp(actor_lp - old_lp)
+                adv = advantages[i]
+                surr1 = ratio * adv
+                surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * adv
+                pg_loss = -(torch.minimum(surr1, surr2) * resp_mask).sum() / n_resp
+                kl = ((old_lp - ref_lp) * resp_mask).sum() / n_resp
+
+                loss_i = (pg_loss + kl_coef * kl) / valid_count
+                accelerator.backward(loss_i)
 
             step_loss_val += loss_i.item()
             step_kl_val += kl.item()
 
-        torch.nn.utils.clip_grad_norm_(
+        accelerator.clip_grad_norm_(
             [p for p in accelerator.unwrap_model(actor).parameters() if p.requires_grad],
             1.0,
         )
