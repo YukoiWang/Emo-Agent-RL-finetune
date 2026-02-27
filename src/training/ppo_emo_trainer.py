@@ -217,6 +217,29 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         os.makedirs(output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
+    # ---------- 5a. Resume from checkpoint ----------
+    resume_from = training_cfg.get("resume_from_checkpoint")
+    global_step = 0
+    step_counter = [0]
+
+    if resume_from and os.path.isdir(resume_from):
+        if accelerator.is_main_process:
+            print(f"[PPO-Emo] Resuming from {resume_from}")
+        from peft import PeftModel
+        unwrapped = accelerator.unwrap_model(actor_ref)
+        unwrapped.actor = PeftModel.from_pretrained(
+            unwrapped.actor.base_model.model, resume_from
+        ).to(device)
+        meta_path = os.path.join(resume_from, "training_state.pt")
+        if os.path.exists(meta_path):
+            state = T.load(meta_path, map_location=device)
+            global_step = state.get("global_step", 0)
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+            if "critic_state_dict" in state:
+                accelerator.unwrap_model(critic).load_state_dict(state["critic_state_dict"])
+            if accelerator.is_main_process:
+                print(f"[PPO-Emo] Resumed: global_step={global_step}")
+
     from .monitor import TrainingMonitor
     monitor_cfg = cfg.get("monitor", {}) or {}
     monitor = TrainingMonitor(
@@ -227,9 +250,8 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         wandb_project=monitor_cfg.get("wandb_project"),
         config=cfg,
         enabled=accelerator.is_main_process,
+        resume=bool(resume_from),
     )
-    global_step = 0
-    step_counter = [0]
 
     def _save():
         if not accelerator.is_main_process:
@@ -238,6 +260,11 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
         unwrapped.actor.save_pretrained(ckpt_dir)
         tokenizer.save_pretrained(ckpt_dir)
+        T.save({
+            "global_step": global_step,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "critic_state_dict": accelerator.unwrap_model(critic).state_dict(),
+        }, os.path.join(ckpt_dir, "training_state.pt"))
         print(f"  [saved] {ckpt_dir}")
 
     def _prune():
@@ -248,60 +275,68 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         while len(ckpts) > save_total_limit:
             shutil.rmtree(ckpts.pop(0), ignore_errors=True)
 
+    grad_accum_steps = rl_cfg.get("gradient_accumulation_steps", 1)
+    if accelerator.is_main_process and grad_accum_steps > 1:
+        print(f"[PPO-Emo] gradient_accumulation_steps={grad_accum_steps}, "
+              f"effective batch = {batch_size} × {accelerator.num_processes} × {grad_accum_steps}")
+
     dataloader_iter = iter(dataloader)
     start_time = time.time()
 
     while global_step < total_steps:
-        try:
-            batch_raw = next(dataloader_iter)
-        except StopIteration:
-            dataloader_iter = iter(dataloader)
-            batch_raw = next(dataloader_iter)
+        # --- Collect rollouts for grad_accum_steps iterations ---
+        step_comp_stats: list[dict[str, float]] = []
+        for _accum in range(grad_accum_steps):
+            try:
+                batch_raw = next(dataloader_iter)
+            except StopIteration:
+                dataloader_iter = iter(dataloader)
+                batch_raw = next(dataloader_iter)
 
-        batch_items = [
-            {
-                "profile": x["profile"],
-                "prompt": x["prompt"],
-                "idx": x["idx"],
-                "target": rollout_cfg.get("target", target_default),
+            batch_items = [
+                {
+                    "profile": x["profile"],
+                    "prompt": x["prompt"],
+                    "idx": x["idx"],
+                    "target": rollout_cfg.get("target", target_default),
+                }
+                for x in batch_raw
+            ]
+
+            step_counter[0] = global_step
+            actor_ref_for_rollout = accelerator.unwrap_model(actor_ref)
+            critic_for_rollout = accelerator.unwrap_model(critic)
+            collect_kw = {
+                "batch_items": batch_items,
+                "actor_ref": actor_ref_for_rollout,
+                "critic": critic_for_rollout,
+                "tokenizer": tokenizer,
+                "user_llm_fn": user_llm_fn,
+                "memory": memory,
+                "get_ref_log_probs_fn": get_ref_log_probs_fn,
+                "device": device,
+                "reward_mode": reward_mode,
+                "w1": reward_cfg.get("w1", 1.0),
+                "w2": reward_cfg.get("w2", 0.3),
+                "w3": reward_cfg.get("w3", 0.2),
+                "trend_n": reward_cfg.get("trend_n", 5),
+                "max_turns": rollout_cfg.get("max_turns", 8),
+                "max_new_tokens_per_turn": rollout_cfg.get("max_new_tokens_per_turn", 128),
+                "do_sample": True,
+                "temperature": rollout_cfg.get("temperature", 0.8),
+                "top_p": rollout_cfg.get("top_p", 0.95),
+                "target": target_default,
+                "sft_model_path": sft_model_path,
+                "planning_llm_fn": planning_llm_fn,
             }
-            for x in batch_raw
-        ]
+            if reward_mode == "mode3":
+                collect_kw["step"] = global_step
+                collect_kw["S1"] = reward_cfg.get("S1", 100)
+                collect_kw["S2"] = reward_cfg.get("S2", 300)
+                collect_kw["warmup_steps"] = reward_cfg.get("warmup_steps", 200)
 
-        step_counter[0] = global_step
-        # rollout 阶段用 unwrap 后的模型，DDP 包装器没有 .generate() 方法
-        actor_ref_for_rollout = accelerator.unwrap_model(actor_ref)
-        critic_for_rollout = accelerator.unwrap_model(critic)
-        collect_kw = {
-            "batch_items": batch_items,
-            "actor_ref": actor_ref_for_rollout,
-            "critic": critic_for_rollout,
-            "tokenizer": tokenizer,
-            "user_llm_fn": user_llm_fn,
-            "memory": memory,
-            "get_ref_log_probs_fn": get_ref_log_probs_fn,
-            "device": device,
-            "reward_mode": reward_mode,
-            "w1": reward_cfg.get("w1", 1.0),
-            "w2": reward_cfg.get("w2", 0.3),
-            "w3": reward_cfg.get("w3", 0.2),
-            "trend_n": reward_cfg.get("trend_n", 5),
-            "max_turns": rollout_cfg.get("max_turns", 8),
-            "max_new_tokens_per_turn": rollout_cfg.get("max_new_tokens_per_turn", 128),
-            "do_sample": True,
-            "temperature": rollout_cfg.get("temperature", 0.8),
-            "top_p": rollout_cfg.get("top_p", 0.95),
-            "target": target_default,
-            "sft_model_path": sft_model_path,
-            "planning_llm_fn": planning_llm_fn,
-        }
-        if reward_mode == "mode3":
-            collect_kw["step"] = global_step
-            collect_kw["S1"] = reward_cfg.get("S1", 100)
-            collect_kw["S2"] = reward_cfg.get("S2", 300)
-            collect_kw["warmup_steps"] = reward_cfg.get("warmup_steps", 200)
-
-        collect_rollouts_emo(**collect_kw)
+            _, _, comp_stats = collect_rollouts_emo(**collect_kw)
+            step_comp_stats.append(comp_stats)
 
         if len(memory) == 0:
             global_step += 1
@@ -401,12 +436,12 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
 
                 del full_ids, full_attn, full_resp_mask, new_log_probs, values, total_loss
 
+        avg_stats = {k: sum(s[k] for s in all_stats) / len(all_stats) for k in all_stats[0]} if all_stats else {}
+        reward_mean = sum(data["rewards"]) / len(data["rewards"]) if data["rewards"] else 0.0
+
         if T.cuda.is_available():
             T.cuda.empty_cache()
         memory.clear()
-
-        avg_stats = {k: sum(s[k] for s in all_stats) / len(all_stats) for k in all_stats[0]} if all_stats else {}
-        reward_mean = sum(data["rewards"]) / len(data["rewards"]) if data["rewards"] else 0.0
         elapsed = time.time() - start_time
         if accelerator.is_main_process and (global_step + 1) % logging_steps == 0:
             print(
@@ -415,9 +450,14 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
                 f"value_loss={avg_stats.get('value_loss', 0):.4f} "
                 f"kl_loss={avg_stats.get('kl_loss', 0):.4f} | {elapsed:.0f}s"
             )
+        avg_comp = {}
+        if step_comp_stats:
+            for k in step_comp_stats[0]:
+                avg_comp[k] = sum(s[k] for s in step_comp_stats) / len(step_comp_stats)
         monitor.log(step=global_step, metrics={
             "reward_mean": reward_mean,
             **avg_stats,
+            **avg_comp,
             "elapsed": elapsed,
         })
 
@@ -433,5 +473,10 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         unwrapped = accelerator.unwrap_model(actor_ref)
         unwrapped.actor.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)
+        T.save({
+            "global_step": global_step,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "critic_state_dict": accelerator.unwrap_model(critic).state_dict(),
+        }, os.path.join(final_dir, "training_state.pt"))
         log_path = os.path.join(output_dir, "training_log.jsonl")
         print(f"[PPO-Emo] 多轮训练完成，模型已保存到 {final_dir}，日志: {log_path}")
