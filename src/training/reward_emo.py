@@ -157,14 +157,14 @@ def compute_reward_tensors(
             trend_r = _trend_reward(turns, n=trend_n)
             vol_p = _volatility_penalty(turns, n=trend_n)
             r = baseline + alpha * w2 * trend_r - beta * w3 * vol_p
-            r = min(1.0, r)
+            # r = min(1.0, r)
         else:
             # mode2
             turns = (emo_point_turns_list or [])[i] if emo_point_turns_list and i < len(emo_point_turns_list) else [emo]
             trend_r = _trend_reward(turns, n=trend_n)
             vol_p = _volatility_penalty(turns, n=trend_n)
             r = w1 * baseline + w2 * trend_r - w3 * vol_p
-            r = min(1.0, r)
+            # r = min(1.0, r)
         rewards_batched.append(r)
 
     # 放到每条回复的最后一个有效 token 位置

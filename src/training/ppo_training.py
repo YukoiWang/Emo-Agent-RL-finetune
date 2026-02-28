@@ -7,6 +7,7 @@ PPO components for LLM fine-tuning:
 - PPOTrainer: training loop
 """
 import copy
+import random
 import torch as T
 import torch.nn as nn
 import torch.nn.functional as F
@@ -349,20 +350,23 @@ class ActorRefRollout(nn.Module):
         attention_mask: T.Tensor,
         response_mask: T.Tensor,
         _chunk: int = 256,
-    ) -> T.Tensor:
+        return_entropy: bool = False,
+    ) -> Union[T.Tensor, Tuple[T.Tensor, T.Tensor]]:
         """
-        Compute response-position token log_probs from causal LM.
+        Compute response-position token log_probs (and optionally entropy) from causal LM.
         logits[:, t, :] predicts input_ids[:, t+1], so log_prob at t+1 from logits[:, t, :].
-        Returns: (batch, full_len), only response positions non-zero.
+        Returns: (batch, full_len) log_probs, or (log_probs, entropy) if return_entropy=True.
         """
         outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-        logits = outputs.logits  # (batch, seq_len, vocab_size)
+        logits = outputs.logits
         del outputs
 
         batch_size, seq_len, vocab = logits.shape
         seq_m1 = seq_len - 1
         shift_labels = input_ids[:, 1:]
         token_log_probs = T.zeros(batch_size, seq_m1, dtype=logits.dtype, device=logits.device)
+        if return_entropy:
+            token_entropy = T.zeros(batch_size, seq_m1, dtype=logits.dtype, device=logits.device)
 
         for start in range(0, seq_m1, _chunk):
             end = min(start + _chunk, seq_m1)
@@ -373,6 +377,10 @@ class ActorRefRollout(nn.Module):
                 chunk_labels.view(-1),
                 reduction="none",
             ).view(batch_size, end - start)
+            if return_entropy:
+                log_p = F.log_softmax(chunk_logits, dim=-1)
+                token_entropy[:, start:end] = -(log_p.exp() * log_p).sum(dim=-1)
+                del log_p
             del chunk_logits, chunk_labels
         del logits, shift_labels
 
@@ -382,6 +390,13 @@ class ActorRefRollout(nn.Module):
             dtype=token_log_probs.dtype, device=token_log_probs.device,
         )
         full_log_probs[:, 1:] = token_log_probs
+        if return_entropy:
+            full_entropy = T.zeros(
+                batch_size, full_len,
+                dtype=token_entropy.dtype, device=token_entropy.device,
+            )
+            full_entropy[:, 1:] = token_entropy
+            return full_log_probs * response_mask, full_entropy * response_mask
         return full_log_probs * response_mask
 
     def forward(
@@ -389,12 +404,16 @@ class ActorRefRollout(nn.Module):
         input_ids: T.Tensor,
         attention_mask: T.Tensor,
         response_mask: T.Tensor,
-    ) -> T.Tensor:
+        return_entropy: bool = False,
+    ) -> Union[T.Tensor, Tuple[T.Tensor, T.Tensor]]:
         """
-        DDP-compatible forward: computes actor log_probs for the response part.
+        DDP-compatible forward: computes actor log_probs (and optionally entropy).
         Call this through the DDP wrapper during training so gradient sync hooks fire.
         """
-        return self._log_probs_from_model(self.actor, input_ids, attention_mask, response_mask)
+        return self._log_probs_from_model(
+            self.actor, input_ids, attention_mask, response_mask,
+            return_entropy=return_entropy,
+        )
 
     def get_actor_log_probs(
         self,
@@ -414,6 +433,17 @@ class ActorRefRollout(nn.Module):
         """
         log_probs = self._log_probs_from_model(self.actor, input_ids, attention_mask, response_mask)
         return log_probs
+
+    def get_actor_log_probs_and_entropy(
+        self,
+        input_ids: T.Tensor,
+        attention_mask: T.Tensor,
+        response_mask: T.Tensor,
+    ) -> Tuple[T.Tensor, T.Tensor]:
+        """Get actor log_probs and per-token entropy for the response part."""
+        return self._log_probs_from_model(
+            self.actor, input_ids, attention_mask, response_mask, return_entropy=True
+        )
 
     def get_ref_log_probs(
         self,
@@ -515,25 +545,51 @@ class PPOTrainer:
         critic: Critic,
         reward_model: Union[RewardModel, Callable[[List[str]], List[float]]],
         memory: PPOMemory,
-        optimizer: T.optim.Optimizer,
+        actor_optimizer: T.optim.Optimizer,
+        critic_optimizer: T.optim.Optimizer,
         ppo_epochs: int = 4,
         mini_batch_size: int = 8,
+        micro_batch_size: int = 2,
         clip_range: float = 0.2,
+        clip_range_value: float = 0.2,
         kl_coef: float = 0.02,
+        entropy_coeff: float = 0.01,
+        max_grad_norm: float = 1.0,
         max_new_tokens: int = 256,
+        gradient_checkpointing: bool = False,
         device: Optional[T.device] = None,
     ):
         self.actor_ref = actor_ref_rollout
         self.critic = critic
         self.reward_model = reward_model if hasattr(reward_model, "compute_reward") else RuleRewardModel(reward_model)
         self.memory = memory
-        self.optimizer = optimizer
+        self.actor_optimizer = actor_optimizer
+        self.critic_optimizer = critic_optimizer
         self.ppo_epochs = ppo_epochs
         self.mini_batch_size = mini_batch_size
+        self.micro_batch_size = micro_batch_size
         self.clip_range = clip_range
+        self.clip_range_value = clip_range_value
         self.kl_coef = kl_coef
+        self.entropy_coeff = entropy_coeff
+        self.max_grad_norm = max_grad_norm
         self.max_new_tokens = max_new_tokens
         self.device = device or next(actor_ref_rollout.actor.parameters()).device
+
+        if gradient_checkpointing:
+            self._enable_gradient_checkpointing()
+
+    def _enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing on actor and critic base models to save memory."""
+        actor_model = self.actor_ref.actor
+        if hasattr(actor_model, 'gradient_checkpointing_enable'):
+            actor_model.gradient_checkpointing_enable()
+        elif hasattr(actor_model, 'base_model') and hasattr(actor_model.base_model, 'gradient_checkpointing_enable'):
+            actor_model.base_model.gradient_checkpointing_enable()
+
+        critic_base = self.critic.base_model
+        if hasattr(critic_base, 'gradient_checkpointing_enable'):
+            critic_base.gradient_checkpointing_enable()
 
     def generate(self, query_ids: T.Tensor, query_mask: T.Tensor) -> Tuple[T.Tensor, T.Tensor, T.Tensor, T.Tensor]:
         """
@@ -677,55 +733,164 @@ class PPOTrainer:
         max_r = max(resp_lens)
         return full_ids, full_attn, full_resp_mask, qlens, resp_lens, max_r
 
-    def ppo_step(self, batch: dict) -> dict:
-        """
-        One PPO update on mini_batch: policy clip loss + value loss + KL penalty,
-        then backward + optimizer.step.
-        Returns stats dict: policy_loss, value_loss, kl_loss, total_loss.
-        """
+    def _prepare_batch_tensors(self, batch: dict) -> dict:
+        """Prepare padded tensors from a mini-batch dict for update_critic / update_actor."""
         pad_id = getattr(self.actor_ref.tokenizer, "pad_token_id", self.actor_ref.tokenizer.eos_token_id)
         full_ids, full_attn, full_resp_mask, qlens, resp_lens, _ = self._build_full_sequence_batch(batch, pad_id)
 
-        old_log_probs_list = batch["log_probs"]
-        ref_log_probs_list = batch["ref_log_probs"]
-        advantages_list = batch["advantages"]
-        returns_list = batch["returns"]
+        old_log_probs, _ = _pad_list_to_tensor(batch["log_probs"], 0.0, self.device)
+        ref_log_probs, _ = _pad_list_to_tensor(batch["ref_log_probs"], 0.0, self.device)
+        advantages, adv_mask = _pad_list_to_tensor(batch["advantages"], 0.0, self.device)
+        returns, ret_mask = _pad_list_to_tensor(batch["returns"], 0.0, self.device)
+        old_values, _ = _pad_list_to_tensor(batch["values"], 0.0, self.device)
 
-        old_log_probs, _ = _pad_list_to_tensor(old_log_probs_list, 0.0, self.device)
-        ref_log_probs, _ = _pad_list_to_tensor(ref_log_probs_list, 0.0, self.device)
-        advantages, adv_mask = _pad_list_to_tensor(advantages_list, 0.0, self.device)
-        returns, ret_mask = _pad_list_to_tensor(returns_list, 0.0, self.device)
+        return {
+            'full_ids': full_ids, 'full_attn': full_attn, 'full_resp_mask': full_resp_mask,
+            'qlens': qlens, 'resp_lens': resp_lens,
+            'old_log_probs': old_log_probs, 'ref_log_probs': ref_log_probs,
+            'advantages': advantages, 'adv_mask': adv_mask,
+            'returns': returns, 'ret_mask': ret_mask,
+            'old_values': old_values,
+        }
 
-        resp_mask_padded, _ = _pad_list_to_tensor(batch["response_masks"], 0.0, self.device)
-        n_valid = resp_mask_padded.sum().clamp(min=1e-8)
+    def _split_into_micro_batches(self, prepared: dict) -> list:
+        """Split prepared tensor dict into micro-batches along the batch dimension."""
+        batch_size = prepared['full_ids'].size(0)
+        tensor_keys = [k for k in prepared if k not in ('qlens', 'resp_lens')]
+        micro_batches = []
+        for start in range(0, batch_size, self.micro_batch_size):
+            end = min(start + self.micro_batch_size, batch_size)
+            mb = {k: prepared[k][start:end] for k in tensor_keys}
+            mb['qlens'] = prepared['qlens'][start:end]
+            mb['resp_lens'] = prepared['resp_lens'][start:end]
+            micro_batches.append(mb)
+        return micro_batches
 
-        new_log_probs = self.actor_ref.get_actor_log_probs(full_ids, full_attn, full_resp_mask)
-        batch_size = full_ids.size(0)
-        new_log_probs_resp = T.zeros_like(old_log_probs, device=self.device)
-        for i in range(batch_size):
-            s, rlen = qlens[i], resp_lens[i]
-            new_log_probs_resp[i, :rlen] = new_log_probs[i, s:s + rlen]
+    def update_critic(self, prepared: dict) -> dict:
+        """
+        Update critic with micro-batch gradient accumulation and clipped value loss.
+        Runs independently from actor update to reduce peak activation memory.
+        """
+        self.critic.train()
+        micro_batches = self._split_into_micro_batches(prepared)
+        n_accum = len(micro_batches)
+        all_mb_metrics: List[dict] = []
 
-        values = self.critic(full_ids, full_attn)
-        values_resp = T.zeros_like(returns, device=self.device)
-        for i in range(batch_size):
-            s, rlen = qlens[i], resp_lens[i]
-            values_resp[i, :rlen] = values[i, s:s + rlen]
+        self.critic_optimizer.zero_grad()
+        for mb in micro_batches:
+            full_ids = mb['full_ids']
+            full_attn = mb['full_attn']
+            qlens = mb['qlens']
+            resp_lens = mb['resp_lens']
+            returns = mb['returns']
+            ret_mask = mb['ret_mask']
+            old_values = mb['old_values']
+            mb_size = full_ids.size(0)
+            n_valid = ret_mask.sum().clamp(min=1e-8)
 
-        ratio = T.exp(new_log_probs_resp - old_log_probs)
-        surr1 = ratio * advantages
-        surr2 = T.clamp(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range) * advantages
-        policy_loss = -(T.minimum(surr1, surr2) * adv_mask).sum() / n_valid
-        value_loss = ((values_resp - returns) ** 2 * ret_mask).sum() / n_valid
-        kl_loss = ((old_log_probs - ref_log_probs) * adv_mask).sum() / n_valid
-        total_loss = policy_loss + 0.5 * value_loss + self.kl_coef * kl_loss
+            values = self.critic(full_ids, full_attn)
+            values_resp = T.zeros_like(returns)
+            for i in range(mb_size):
+                s, rlen = qlens[i], resp_lens[i]
+                values_resp[i, :rlen] = values[i, s:s + rlen]
 
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        T.nn.utils.clip_grad_norm_(self.actor_ref.parameters_for_optimizer(), 1.0)
-        self.optimizer.step()
+            vpred_clipped = old_values + T.clamp(
+                values_resp - old_values, -self.clip_range_value, self.clip_range_value
+            )
+            vf_loss1 = (values_resp - returns) ** 2
+            vf_loss2 = (vpred_clipped - returns) ** 2
+            vf_loss = 0.5 * (T.maximum(vf_loss1, vf_loss2) * ret_mask).sum() / n_valid
 
-        return {"policy_loss": policy_loss.item(), "value_loss": value_loss.item(), "kl_loss": kl_loss.item(), "total_loss": total_loss.item()}
+            loss = vf_loss / n_accum
+            loss.backward()
+
+            n_mask = ret_mask.sum().clamp(min=1)
+            all_mb_metrics.append({
+                'critic/vf_loss': vf_loss.detach().item(),
+                'critic/vf_clipfrac': ((vf_loss2 > vf_loss1).float() * ret_mask).sum().item() / n_mask.item(),
+                'critic/vpred_mean': (values_resp.detach() * ret_mask).sum().item() / n_mask.item(),
+            })
+
+        critic_grad_norm = T.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+        self.critic_optimizer.step()
+        self.critic_optimizer.zero_grad()
+
+        metrics = _aggregate_stats(all_mb_metrics) if all_mb_metrics else {}
+        metrics['critic/grad_norm'] = critic_grad_norm.detach().item()
+        return metrics
+
+    def update_actor(self, prepared: dict) -> dict:
+        """
+        Update actor with micro-batch gradient accumulation, entropy bonus, and KL penalty.
+        Runs after update_critic so their activations don't coexist in memory.
+        """
+        self.actor_ref.actor.train()
+        micro_batches = self._split_into_micro_batches(prepared)
+        n_accum = len(micro_batches)
+        all_mb_metrics: List[dict] = []
+
+        self.actor_optimizer.zero_grad()
+        for mb in micro_batches:
+            full_ids = mb['full_ids']
+            full_attn = mb['full_attn']
+            full_resp_mask = mb['full_resp_mask']
+            qlens = mb['qlens']
+            resp_lens = mb['resp_lens']
+            old_log_probs = mb['old_log_probs']
+            ref_log_probs = mb['ref_log_probs']
+            advantages = mb['advantages']
+            adv_mask = mb['adv_mask']
+            mb_size = full_ids.size(0)
+            n_valid = adv_mask.sum().clamp(min=1e-8)
+
+            new_log_probs, entropy = self.actor_ref.get_actor_log_probs_and_entropy(
+                full_ids, full_attn, full_resp_mask
+            )
+
+            new_log_probs_resp = T.zeros_like(old_log_probs)
+            entropy_resp = T.zeros_like(old_log_probs)
+            for i in range(mb_size):
+                s, rlen = qlens[i], resp_lens[i]
+                new_log_probs_resp[i, :rlen] = new_log_probs[i, s:s + rlen]
+                entropy_resp[i, :rlen] = entropy[i, s:s + rlen]
+
+            ratio = T.exp(new_log_probs_resp - old_log_probs)
+            surr1 = ratio * advantages
+            surr2 = T.clamp(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range) * advantages
+            pg_loss = -(T.minimum(surr1, surr2) * adv_mask).sum() / n_valid
+
+            entropy_loss = (entropy_resp * adv_mask).sum() / n_valid
+
+            kl_loss = ((new_log_probs_resp - ref_log_probs) * adv_mask).sum() / n_valid
+
+            policy_loss = pg_loss - self.entropy_coeff * entropy_loss + self.kl_coef * kl_loss
+
+            loss = policy_loss / n_accum
+            loss.backward()
+
+            n_mask = adv_mask.sum().clamp(min=1)
+            pg_clipfrac = ((ratio.detach() - 1.0).abs() > self.clip_range).float()
+            pg_clipfrac = (pg_clipfrac * adv_mask).sum().item() / n_mask.item()
+            ppo_kl = 0.5 * ((new_log_probs_resp.detach() - old_log_probs) ** 2 * adv_mask).sum().item() / n_mask.item()
+
+            all_mb_metrics.append({
+                'actor/pg_loss': pg_loss.detach().item(),
+                'actor/entropy_loss': entropy_loss.detach().item(),
+                'actor/kl_loss': kl_loss.detach().item(),
+                'actor/policy_loss': policy_loss.detach().item(),
+                'actor/pg_clipfrac': pg_clipfrac,
+                'actor/ppo_kl': ppo_kl,
+            })
+
+        actor_grad_norm = T.nn.utils.clip_grad_norm_(
+            self.actor_ref.parameters_for_optimizer(), self.max_grad_norm
+        )
+        self.actor_optimizer.step()
+        self.actor_optimizer.zero_grad()
+
+        metrics = _aggregate_stats(all_mb_metrics) if all_mb_metrics else {}
+        metrics['actor/grad_norm'] = actor_grad_norm.detach().item()
+        return metrics
 
     def train_step(self) -> dict:
         if len(self.memory) == 0:
@@ -733,35 +898,42 @@ class PPOTrainer:
         data = self.memory.get(compute_gae=True)
         all_stats = []
         for _ in range(self.ppo_epochs):
-            mini = self.memory.sample(mini_batch_size=self.mini_batch_size, compute_gae=False)
-            mini["advantages"] = [data["advantages"][i] for i in [data["queries"].index(q) for q in mini["queries"]]]
-            mini["returns"] = [data["returns"][i] for i in [data["queries"].index(q) for q in mini["queries"]]]
-            # Sample indices from data
             indices = list(range(len(data["queries"])))
             if self.mini_batch_size and self.mini_batch_size < len(indices):
-                import random
                 idx = random.sample(indices, self.mini_batch_size)
             else:
                 idx = indices
             mini = {k: [v[i] for i in idx] if isinstance(v, list) else v for k, v in data.items()}
-            stats = self.ppo_step(mini)
+
+            prepared = self._prepare_batch_tensors(mini)
+            critic_stats = self.update_critic(prepared)
+            actor_stats = self.update_actor(prepared)
+
+            stats = {**critic_stats, **actor_stats}
             all_stats.append(stats)
         return _aggregate_stats(all_stats) if all_stats else {}
 
-    def run(self, dataloader, total_steps: int, max_prompt_length: int = 1024) -> None:
+    def run(self, dataloader, total_steps: int, max_prompt_length: int = 1024, log_interval: int = 1) -> None:
         for step in range(total_steps):
             self.collect_rollouts(dataloader, max_prompt_length=max_prompt_length, batches_per_rollout=1)
             if len(self.memory) > 0:
-                self.train_step()
+                stats = self.train_step()
+                if stats and (step + 1) % log_interval == 0:
+                    parts = [f"step={step+1}/{total_steps}"]
+                    for k, v in sorted(stats.items()):
+                        parts.append(f"{k}={v:.4f}")
+                    print(" | ".join(parts))
             self.memory.clear()
 
 
 def _aggregate_stats(stats_list: list) -> dict:
-    """Average stats from multiple ppo_step calls."""
+    """Average stats across multiple update steps / micro-batches."""
     if not stats_list:
         return {}
-    keys = stats_list[0].keys()
-    return {k: sum(s[k] for s in stats_list) / len(stats_list) for k in keys}
+    all_keys: set = set()
+    for s in stats_list:
+        all_keys.update(s.keys())
+    return {k: sum(s.get(k, 0) for s in stats_list) / len(stats_list) for k in all_keys}
 
 
 def _pad_list_to_tensor(

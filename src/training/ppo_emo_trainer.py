@@ -94,10 +94,19 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         save_total_limit: 3
         logging_steps: 10
     """
+    import datetime
+    nccl_timeout_min = cfg.get("training", {}).get("nccl_timeout_minutes", 30)
+    os.environ.setdefault("NCCL_BLOCKING_WAIT", "0")
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+
     seed = cfg.get("seed", 42)
     T.manual_seed(seed)
 
-    accelerator = Accelerator()
+    from accelerate.utils import InitProcessGroupKwargs
+    kwargs = InitProcessGroupKwargs(
+        timeout=datetime.timedelta(minutes=nccl_timeout_min),
+    )
+    accelerator = Accelerator(kwargs_handlers=[kwargs])
     device = accelerator.device
 
     model_cfg = cfg.get("model", {})
@@ -202,14 +211,19 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         return full_lp[:, q_len:]
 
     lr = rl_cfg.get("learning_rate", 1e-6)
-    optimizer = T.optim.AdamW(
-        list(actor_ref.parameters_for_optimizer()) + list(critic.parameters()),
+    critic_lr = rl_cfg.get("critic_learning_rate", lr)
+    actor_optimizer = T.optim.AdamW(
+        actor_ref.parameters_for_optimizer(),
         lr=lr,
+    )
+    critic_optimizer = T.optim.AdamW(
+        critic.parameters(),
+        lr=critic_lr,
     )
 
     # ---------- 4b. Accelerate prepare（多卡时自动 DDP）----------
-    actor_ref, critic, optimizer, dataloader = accelerator.prepare(
-        actor_ref, critic, optimizer, dataloader
+    actor_ref, critic, actor_optimizer, critic_optimizer, dataloader = accelerator.prepare(
+        actor_ref, critic, actor_optimizer, critic_optimizer, dataloader
     )
 
     # ---------- 5. 训练循环 ----------
@@ -234,7 +248,12 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         if os.path.exists(meta_path):
             state = T.load(meta_path, map_location=device)
             global_step = state.get("global_step", 0)
-            optimizer.load_state_dict(state["optimizer_state_dict"])
+            if "actor_optimizer_state_dict" in state:
+                actor_optimizer.load_state_dict(state["actor_optimizer_state_dict"])
+                critic_optimizer.load_state_dict(state["critic_optimizer_state_dict"])
+            elif "optimizer_state_dict" in state:
+                if accelerator.is_main_process:
+                    print("[PPO-Emo] Old checkpoint format (single optimizer), skipping optimizer state")
             if "critic_state_dict" in state:
                 accelerator.unwrap_model(critic).load_state_dict(state["critic_state_dict"])
             if accelerator.is_main_process:
@@ -262,7 +281,8 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         tokenizer.save_pretrained(ckpt_dir)
         T.save({
             "global_step": global_step,
-            "optimizer_state_dict": optimizer.state_dict(),
+            "actor_optimizer_state_dict": actor_optimizer.state_dict(),
+            "critic_optimizer_state_dict": critic_optimizer.state_dict(),
             "critic_state_dict": accelerator.unwrap_model(critic).state_dict(),
         }, os.path.join(ckpt_dir, "training_state.pt"))
         print(f"  [saved] {ckpt_dir}")
@@ -338,6 +358,11 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
             _, _, comp_stats = collect_rollouts_emo(**collect_kw)
             step_comp_stats.append(comp_stats)
 
+        # Barrier: all ranks must finish rollout before any enters DDP update,
+        # otherwise the faster rank's DDP forward blocks on NCCL collectives
+        # that the slower rank hasn't reached yet → NCCL timeout.
+        accelerator.wait_for_everyone()
+
         if len(memory) == 0:
             global_step += 1
             continue
@@ -347,10 +372,22 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         ppo_epochs = rl_cfg.get("ppo_epochs", 2)
         mini_batch_size = rl_cfg.get("mini_batch_size", 1)
         clip_range = rl_cfg.get("clip_range", 0.2)
+        clip_range_value = rl_cfg.get("clip_range_value", 0.2)
         kl_coef = rl_cfg.get("kl_penalty_coef", 0.02)
+        entropy_coeff = rl_cfg.get("entropy_coeff", 0.01)
+        max_grad_norm = rl_cfg.get("max_grad_norm", 1.0)
 
-        total_buffer_size = len(data["queries"])
-        indices = list(range(total_buffer_size))
+        local_buffer_size = len(data["queries"])
+        # All ranks must iterate the same number of DDP forward passes; use the
+        # max buffer size so no rank exits the loop early while others still call
+        # DDP forward (which would deadlock on NCCL collectives).
+        if accelerator.num_processes > 1:
+            buf_tensor = T.tensor([local_buffer_size], device=device)
+            T.distributed.all_reduce(buf_tensor, op=T.distributed.ReduceOp.MAX)
+            total_buffer_size = int(buf_tensor.item())
+        else:
+            total_buffer_size = local_buffer_size
+        indices = list(range(local_buffer_size))
         pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
         all_stats: list[dict[str, float]] = []
@@ -359,7 +396,7 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
             random.shuffle(indices)
 
             for i in range(0, total_buffer_size, mini_batch_size):
-                batch_indices = indices[i : i + mini_batch_size]
+                batch_indices = [idx % local_buffer_size for idx in range(i, min(i + mini_batch_size, total_buffer_size))]
                 if not batch_indices:
                     continue
 
@@ -372,6 +409,7 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
                 ref_log_probs_list = [data["ref_log_probs"][idx] for idx in batch_indices]
                 advantages_list = [data["advantages"][idx] for idx in batch_indices]
                 returns_list = [data["returns"][idx] for idx in batch_indices]
+                old_values_list = [data["values"][idx] for idx in batch_indices]
 
                 qlens = [q.size(0) for q in queries]
                 resp_lens = [r.size(0) for r in responses]
@@ -391,50 +429,88 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
                     full_attn[j, qlen : qlen + rlen] = response_masks[j].to(T.float32).to(device)
                     full_resp_mask[j, qlen : qlen + rlen] = response_masks[j].to(T.float32).to(device)
 
-                new_log_probs = actor_ref(full_ids, full_attn, full_resp_mask)
-                values = critic(full_ids, full_attn)
-
                 old_log_probs, _ = _pad_list_to_tensor(old_log_probs_list, 0.0, device)
                 ref_log_probs, _ = _pad_list_to_tensor(ref_log_probs_list, 0.0, device)
                 advantages, adv_mask = _pad_list_to_tensor(advantages_list, 0.0, device)
                 returns, ret_mask = _pad_list_to_tensor(returns_list, 0.0, device)
-
+                old_values, _ = _pad_list_to_tensor(old_values_list, 0.0, device)
                 max_r = max(resp_lens)
-                new_lp_resp = T.zeros(curr_bs, max_r, dtype=T.float32, device=device)
-                values_resp = T.zeros(curr_bs, max_r, dtype=T.float32, device=device)
 
+                # --- Critic Update (separate forward/backward) ---
+                values_out = critic(full_ids, full_attn)
+                values_resp = T.zeros(curr_bs, max_r, dtype=T.float32, device=device)
+                for j in range(curr_bs):
+                    s, rlen = qlens[j], resp_lens[j]
+                    values_resp[j, :rlen] = values_out[j, s : s + rlen]
+
+                vpred_clipped = old_values + T.clamp(
+                    values_resp - old_values, -clip_range_value, clip_range_value
+                )
+                vf_loss1 = (values_resp - returns) ** 2
+                vf_loss2 = (vpred_clipped - returns) ** 2
+                valid_ret = ret_mask.sum().clamp(min=1e-8)
+                vf_loss = 0.5 * (T.maximum(vf_loss1, vf_loss2) * ret_mask).sum() / valid_ret
+
+                critic_optimizer.zero_grad()
+                accelerator.backward(vf_loss)
+                critic_grad_norm = T.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
+                critic_optimizer.step()
+
+                n_ret = ret_mask.sum().clamp(min=1)
+                vf_clipfrac = ((vf_loss2 > vf_loss1).float() * ret_mask).sum().item() / n_ret.item()
+                vpred_mean = (values_resp.detach() * ret_mask).sum().item() / n_ret.item()
+                del values_out
+
+                # --- Actor Update (separate forward/backward, with entropy bonus) ---
+                new_log_probs, entropy_full = actor_ref(
+                    full_ids, full_attn, full_resp_mask, return_entropy=True
+                )
+
+                new_lp_resp = T.zeros(curr_bs, max_r, dtype=T.float32, device=device)
+                entropy_resp = T.zeros(curr_bs, max_r, dtype=T.float32, device=device)
                 for j in range(curr_bs):
                     s, rlen = qlens[j], resp_lens[j]
                     new_lp_resp[j, :rlen] = new_log_probs[j, s : s + rlen]
-                    values_resp[j, :rlen] = values[j, s : s + rlen]
+                    entropy_resp[j, :rlen] = entropy_full[j, s : s + rlen]
 
                 ratio = T.exp(new_lp_resp - old_log_probs)
                 surr1 = ratio * advantages
                 surr2 = T.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
-
                 valid_count = adv_mask.sum().clamp(min=1e-8)
 
-                policy_loss = -(T.minimum(surr1, surr2) * adv_mask).sum() / valid_count
-                value_loss = ((values_resp - returns) ** 2 * ret_mask).sum() / valid_count
-                kl_loss = ((old_log_probs - ref_log_probs) * adv_mask).sum() / valid_count
-                total_loss = policy_loss + 0.5 * value_loss + kl_coef * kl_loss
+                pg_loss = -(T.minimum(surr1, surr2) * adv_mask).sum() / valid_count
+                entropy_loss = (entropy_resp * adv_mask).sum() / valid_count
+                kl_loss = ((new_lp_resp - ref_log_probs) * adv_mask).sum() / valid_count
+                policy_loss = pg_loss - entropy_coeff * entropy_loss + kl_coef * kl_loss
+
+                actor_optimizer.zero_grad()
+                accelerator.backward(policy_loss)
+                actor_grad_norm = T.nn.utils.clip_grad_norm_(
+                    list(accelerator.unwrap_model(actor_ref).parameters_for_optimizer()),
+                    max_grad_norm,
+                )
+                actor_optimizer.step()
+
+                n_adv = adv_mask.sum().clamp(min=1)
+                pg_clipfrac = ((ratio.detach() - 1.0).abs() > clip_range).float()
+                pg_clipfrac = (pg_clipfrac * adv_mask).sum().item() / n_adv.item()
+                ppo_kl = 0.5 * ((new_lp_resp.detach() - old_log_probs) ** 2 * adv_mask).sum().item() / n_adv.item()
 
                 all_stats.append({
-                    "policy_loss": policy_loss.item(),
-                    "value_loss": value_loss.item(),
-                    "kl_loss": kl_loss.item(),
-                    "total_loss": total_loss.item(),
+                    "actor/pg_loss": pg_loss.item(),
+                    "actor/entropy_loss": entropy_loss.item(),
+                    "actor/kl_loss": kl_loss.item(),
+                    "actor/policy_loss": policy_loss.item(),
+                    "actor/pg_clipfrac": pg_clipfrac,
+                    "actor/ppo_kl": ppo_kl,
+                    "actor/grad_norm": actor_grad_norm.item(),
+                    "critic/vf_loss": vf_loss.item(),
+                    "critic/vf_clipfrac": vf_clipfrac,
+                    "critic/vpred_mean": vpred_mean,
+                    "critic/grad_norm": critic_grad_norm.item(),
                 })
 
-                optimizer.zero_grad()
-                accelerator.backward(total_loss)
-                T.nn.utils.clip_grad_norm_(
-                    list(accelerator.unwrap_model(actor_ref).parameters_for_optimizer()) + list(critic.parameters()),
-                    1.0,
-                )
-                optimizer.step()
-
-                del full_ids, full_attn, full_resp_mask, new_log_probs, values, total_loss
+                del full_ids, full_attn, full_resp_mask, new_log_probs, entropy_full, policy_loss, vf_loss
 
         avg_stats = {k: sum(s[k] for s in all_stats) / len(all_stats) for k in all_stats[0]} if all_stats else {}
         reward_mean = sum(data["rewards"]) / len(data["rewards"]) if data["rewards"] else 0.0
@@ -445,10 +521,13 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         elapsed = time.time() - start_time
         if accelerator.is_main_process and (global_step + 1) % logging_steps == 0:
             print(
-                f"  step={global_step + 1}/{total_steps} | reward_mean={reward_mean:.4f} | "
-                f"policy_loss={avg_stats.get('policy_loss', 0):.4f} "
-                f"value_loss={avg_stats.get('value_loss', 0):.4f} "
-                f"kl_loss={avg_stats.get('kl_loss', 0):.4f} | {elapsed:.0f}s"
+                f"  step={global_step + 1}/{total_steps} | reward={reward_mean:.4f} | "
+                f"pg={avg_stats.get('actor/pg_loss', 0):.4f} "
+                f"vf={avg_stats.get('critic/vf_loss', 0):.4f} "
+                f"ent={avg_stats.get('actor/entropy_loss', 0):.4f} "
+                f"kl={avg_stats.get('actor/kl_loss', 0):.4f} "
+                f"pg_clip={avg_stats.get('actor/pg_clipfrac', 0):.3f} "
+                f"vf_clip={avg_stats.get('critic/vf_clipfrac', 0):.3f} | {elapsed:.0f}s"
             )
         avg_comp = {}
         if step_comp_stats:
@@ -475,7 +554,8 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         tokenizer.save_pretrained(final_dir)
         T.save({
             "global_step": global_step,
-            "optimizer_state_dict": optimizer.state_dict(),
+            "actor_optimizer_state_dict": actor_optimizer.state_dict(),
+            "critic_optimizer_state_dict": critic_optimizer.state_dict(),
             "critic_state_dict": accelerator.unwrap_model(critic).state_dict(),
         }, os.path.join(final_dir, "training_state.pt"))
         log_path = os.path.join(output_dir, "training_log.jsonl")
