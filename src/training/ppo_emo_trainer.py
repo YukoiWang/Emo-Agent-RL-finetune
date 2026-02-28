@@ -275,7 +275,7 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         while len(ckpts) > save_total_limit:
             shutil.rmtree(ckpts.pop(0), ignore_errors=True)
 
-    grad_accum_steps = rl_cfg.get("gradient_accumulation_steps", 1)
+    grad_accum_steps = rl_cfg.get("gradient_accumulation_steps") or 1
     if accelerator.is_main_process and grad_accum_steps > 1:
         print(f"[PPO-Emo] gradient_accumulation_steps={grad_accum_steps}, "
               f"effective batch = {batch_size} × {accelerator.num_processes} × {grad_accum_steps}")

@@ -1,0 +1,37 @@
+# Static-RL 评估配置
+# 用法: python static-rl/eval_static_models.py --config static-rl/configs/eval.yaml
+#
+# 请根据你的实际 checkpoint 路径修改下面的 models 部分
+
+model:
+  base_model: "Qwen/Qwen2.5-1.5B-Instruct"
+  sft_model_path: ""   # SFT 基线模型路径，留空则跳过
+
+data:
+  train_file: "data/ipm_prefdial_dpo.jsonl"   # 你的偏好对数据
+  test_ratio: 0.1
+  max_test: 200
+
+reward:
+  reward_model_path: "static-rl/outputs/reward_model"   # 训练好的 RM 路径
+
+# 需要评估的模型：名称 -> checkpoint 路径
+# 根据你实际训练的输出目录修改
+models:
+  DPO: "static-rl/outputs/dpo/final"
+  PPO: "static-rl/outputs/ppo/final"
+  GRPO: "static-rl/outputs/grpo/final"
+
+eval:
+  max_new_tokens: 256
+  device: "cuda"
+  seed: 42
+
+# LLM-as-Judge 配置（可选，不配置则跳过）
+judge:
+  api_base: ""          # 例如 "https://api.deepseek.com/v1"
+  api_key: ""           # 你的 API key
+  model: "deepseek-chat"
+
+output:
+  path: "static-rl/outputs/eval_results.json"

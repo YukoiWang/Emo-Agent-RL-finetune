@@ -195,6 +195,10 @@ def run_grpo_training(
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
+    grad_accum_steps = rl_cfg.get("gradient_accumulation_steps", 1)
+    if accelerator.is_main_process and grad_accum_steps > 1:
+        print(f"[GRPO] gradient_accumulation_steps={grad_accum_steps}")
+
     log_path = os.path.join(output_dir, "training_log.jsonl")
     log_file = open(log_path, "w", encoding="utf-8") if accelerator.is_main_process else None
     data_iter = iter(dataloader)
@@ -204,87 +208,100 @@ def run_grpo_training(
     t0 = time.time()
 
     while global_step < total_steps:
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
+        optimizer.zero_grad()
+        step_loss_val = 0.0
+        step_kl_val = 0.0
+        step_rewards: List[float] = []
+        prompts_done = 0
 
-        prompt_ids = batch["input_ids"][:1].to(device)
-        prompt_mask = batch["attention_mask"][:1].to(device)
-        q_len = prompt_ids.size(1)
+        for _accum_idx in range(grad_accum_steps):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
 
-        # 1) 生成 G 个 completion
-        actor.eval()
-        resp_ids_list, resp_texts = _generate_completions(
-            actor, tokenizer, prompt_ids, prompt_mask,
-            num_generations=num_generations, max_new_tokens=max_resp_len,
-            temperature=temperature, top_p=top_p,
-        )
+            prompt_ids = batch["input_ids"][:1].to(device)
+            prompt_mask = batch["attention_mask"][:1].to(device)
+            q_len = prompt_ids.size(1)
 
-        # 2) 打分
-        rewards = reward_fn(resp_texts)
-        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
-
-        # 3) 组内归一化 advantage
-        r_mean = rewards_t.mean()
-        r_std = rewards_t.std().clamp(min=1e-6)
-        advantages = (rewards_t - r_mean) / r_std
-
-        # 4) 计算 loss
-        actor.train()
-        policy_loss = torch.tensor(0.0, device=device)
-        kl_loss = torch.tensor(0.0, device=device)
-        valid_count = 0
-
-        for i in range(num_generations):
-            resp = resp_ids_list[i]
-            if resp.numel() == 0:
-                continue
-            full_ids = torch.cat([prompt_ids[0], resp]).unsqueeze(0)
-            full_mask = torch.ones_like(full_ids, dtype=torch.float32)
-
-            actor_lp = _log_probs_for_response(actor, full_ids, full_mask, q_len)
-            with torch.no_grad():
-                ref_lp = _log_probs_for_response(ref_model, full_ids, full_mask, q_len)
-                old_lp = actor_lp.detach()
-
-            min_len = min(actor_lp.size(0), ref_lp.size(0), old_lp.size(0))
-            actor_lp = actor_lp[:min_len]
-            ref_lp = ref_lp[:min_len]
-            old_lp = old_lp[:min_len]
-
-            ratio = torch.exp(actor_lp - old_lp)
-            adv = advantages[i]
-            surr1 = ratio * adv
-            surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * adv
-            policy_loss = policy_loss - torch.minimum(surr1, surr2).mean()
-
-            kl = (old_lp - ref_lp).mean()
-            kl_loss = kl_loss + kl
-
-            valid_count += 1
-
-        if valid_count > 0:
-            loss = (policy_loss + kl_coef * kl_loss) / valid_count
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in actor.parameters() if p.requires_grad], 1.0,
+            actor.eval()
+            resp_ids_list, resp_texts = _generate_completions(
+                actor, tokenizer, prompt_ids, prompt_mask,
+                num_generations=num_generations, max_new_tokens=max_resp_len,
+                temperature=temperature, top_p=top_p,
             )
-            optimizer.step()
-            total_loss_acc += loss.item()
-            total_reward_acc += r_mean.item()
-            kl_avg = (kl_loss / valid_count).item()
-            if accelerator.is_main_process and log_file is not None:
-                log_record = {
-                    "step": global_step,
-                    "reward_mean": r_mean.item(),
-                    "loss": loss.item(),
-                    "kl_loss": kl_avg,
-                }
-                log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
-                log_file.flush()
+
+            rewards = reward_fn(resp_texts)
+            rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
+
+            r_mean = rewards_t.mean()
+            r_std = rewards_t.std().clamp(min=1e-6)
+            advantages = (rewards_t - r_mean) / r_std
+
+            actor.train()
+            policy_loss = torch.tensor(0.0, device=device)
+            kl_loss_accum = torch.tensor(0.0, device=device)
+            valid_count = 0
+
+            for i in range(num_generations):
+                resp = resp_ids_list[i]
+                if resp.numel() == 0:
+                    continue
+                full_ids = torch.cat([prompt_ids[0], resp]).unsqueeze(0)
+                full_mask = torch.ones_like(full_ids, dtype=torch.float32)
+
+                actor_lp = _log_probs_for_response(actor, full_ids, full_mask, q_len)
+                with torch.no_grad():
+                    ref_lp = _log_probs_for_response(ref_model, full_ids, full_mask, q_len)
+                    old_lp = actor_lp.detach()
+
+                min_len = min(actor_lp.size(0), ref_lp.size(0), old_lp.size(0))
+                actor_lp = actor_lp[:min_len]
+                ref_lp = ref_lp[:min_len]
+                old_lp = old_lp[:min_len]
+
+                ratio = torch.exp(actor_lp - old_lp)
+                adv = advantages[i]
+                surr1 = ratio * adv
+                surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * adv
+                policy_loss = policy_loss - torch.minimum(surr1, surr2).mean()
+
+                kl = (old_lp - ref_lp).mean()
+                kl_loss_accum = kl_loss_accum + kl
+
+                valid_count += 1
+
+            if valid_count > 0:
+                loss = (policy_loss + kl_coef * kl_loss_accum) / (valid_count * grad_accum_steps)
+                accelerator.backward(loss)
+                step_loss_val += loss.item()
+                step_kl_val += (kl_loss_accum / valid_count).item()
+                step_rewards.extend(rewards)
+                prompts_done += 1
+
+        if prompts_done == 0:
+            global_step += 1
+            continue
+
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in actor.parameters() if p.requires_grad], 1.0,
+        )
+        optimizer.step()
+
+        agg_reward_mean = sum(step_rewards) / len(step_rewards)
+        total_loss_acc += step_loss_val
+        total_reward_acc += agg_reward_mean
+
+        if accelerator.is_main_process and log_file is not None:
+            log_record = {
+                "step": global_step,
+                "reward_mean": agg_reward_mean,
+                "loss": step_loss_val,
+                "kl_loss": step_kl_val / prompts_done,
+            }
+            log_file.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+            log_file.flush()
 
         global_step += 1
 
@@ -615,6 +632,27 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
         )
     accelerator.wait_for_everyone()
 
+    # ---------- 6a. Resume from checkpoint ----------
+    resume_from = training_cfg.get("resume_from_checkpoint")
+    global_step = 0
+
+    if resume_from and os.path.isdir(resume_from):
+        if accelerator.is_main_process:
+            print(f"[GRPO-Emo] Resuming from {resume_from}")
+        from peft import PeftModel
+        unwrapped = accelerator.unwrap_model(actor)
+        base_model = unwrapped.base_model.model if hasattr(unwrapped, "base_model") else unwrapped
+        actor_loaded = PeftModel.from_pretrained(base_model, resume_from).to(device)
+        unwrapped.load_state_dict(actor_loaded.state_dict(), strict=False)
+        del actor_loaded
+        meta_path = os.path.join(resume_from, "training_state.pt")
+        if os.path.exists(meta_path):
+            state = torch.load(meta_path, map_location=device)
+            global_step = state.get("global_step", 0)
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+            if accelerator.is_main_process:
+                print(f"[GRPO-Emo] Resumed: global_step={global_step}")
+
     from .monitor import TrainingMonitor
     monitor_cfg = cfg.get("monitor", {}) or {}
     monitor = TrainingMonitor(
@@ -625,95 +663,109 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
         wandb_project=monitor_cfg.get("wandb_project"),
         config=cfg,
         enabled=accelerator.is_main_process,
+        resume=bool(resume_from),
     )
 
+    grad_accum_steps = rl_cfg.get("gradient_accumulation_steps", 1)
+    if accelerator.is_main_process and grad_accum_steps > 1:
+        print(f"[GRPO-Emo] gradient_accumulation_steps={grad_accum_steps}, "
+              f"effective prompts/step = {grad_accum_steps} × G={num_generations}")
+
     data_iter = iter(dataloader)
-    global_step = 0
     total_loss_acc = 0.0
     total_reward_acc = 0.0
     t0 = time.time()
 
     while global_step < total_steps:
-        try:
-            batch_raw = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch_raw = next(data_iter)
-
-        item = batch_raw[0]
-        profile = item["profile"]
-        prompt = item["prompt"]
-
-        # --- 6a. Generate G multi-turn dialogues ---
-        actor_unwrapped = accelerator.unwrap_model(actor)
-        actor_unwrapped.eval()
-
-        rollout_results: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, List[float]]] = []
-        for _g in range(num_generations):
-            out = _run_multiturn_grpo_rollout(
-                profile=profile, prompt=prompt,
-                model=actor_unwrapped, tokenizer=tokenizer,
-                user_llm_fn=user_llm_fn, planning_llm_fn=planning_llm_fn,
-                device=device, max_turns=max_turns,
-                max_new_tokens_per_turn=max_new_tokens,
-                do_sample=True, temperature=temperature, top_p=top_p,
-                target=target, sft_model_path=sft_model_path,
-            )
-            if out is not None:
-                rollout_results.append(out)
-
-        valid_count = len(rollout_results)
-        if valid_count == 0:
-            global_step += 1
-            continue
-
-        # --- 6b. Compute rewards ---
-        rewards = []
-        for _, _, _, emo_pt, emo_turns in rollout_results:
-            r = _compute_emo_reward_scalar(
-                emo_pt, emo_turns, reward_mode, w1, w2, w3, trend_n,
-                step=global_step, S1=S1, S2=S2, warmup_steps=warmup_steps_reward,
-            )
-            rewards.append(r)
-
-        rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
-        r_mean = rewards_t.mean()
-        r_std = rewards_t.std().clamp(min=1e-6)
-        advantages = (rewards_t - r_mean) / r_std
-
-        # --- 6c. Policy update (gradient accumulation over G dialogues) ---
-        # Use the DDP-wrapped `actor` (not unwrapped) so that gradient
-        # allreduce fires correctly on multi-GPU setups.
-        actor.train()
         optimizer.zero_grad()
         step_loss_val = 0.0
         step_kl_val = 0.0
+        step_rewards_all: List[float] = []
+        prompts_done = 0
 
-        for i, (full_ids, full_mask, resp_mask, _, _) in enumerate(rollout_results):
-            n_resp = resp_mask.sum().clamp(min=1)
+        for _accum_idx in range(grad_accum_steps):
+            try:
+                batch_raw = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                batch_raw = next(data_iter)
 
-            # Suppress DDP allreduce on non-last iterations (saves bandwidth)
-            is_last = (i == valid_count - 1)
-            sync_ctx = contextlib.nullcontext() if is_last else accelerator.no_sync(actor)
+            item = batch_raw[0]
+            profile = item["profile"]
+            prompt = item["prompt"]
 
-            with sync_ctx:
-                actor_lp = _masked_log_probs(actor, full_ids, full_mask, resp_mask)
-                with torch.no_grad():
-                    ref_lp = _masked_log_probs(ref_model, full_ids, full_mask, resp_mask)
-                    old_lp = actor_lp.detach()
+            # --- Generate G multi-turn dialogues ---
+            actor_unwrapped = accelerator.unwrap_model(actor)
+            actor_unwrapped.eval()
 
-                ratio = torch.exp(actor_lp - old_lp)
-                adv = advantages[i]
-                surr1 = ratio * adv
-                surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * adv
-                pg_loss = -(torch.minimum(surr1, surr2) * resp_mask).sum() / n_resp
-                kl = ((old_lp - ref_lp) * resp_mask).sum() / n_resp
+            rollout_results: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, List[float]]] = []
+            for _g in range(num_generations):
+                out = _run_multiturn_grpo_rollout(
+                    profile=profile, prompt=prompt,
+                    model=actor_unwrapped, tokenizer=tokenizer,
+                    user_llm_fn=user_llm_fn, planning_llm_fn=planning_llm_fn,
+                    device=device, max_turns=max_turns,
+                    max_new_tokens_per_turn=max_new_tokens,
+                    do_sample=True, temperature=temperature, top_p=top_p,
+                    target=target, sft_model_path=sft_model_path,
+                )
+                if out is not None:
+                    rollout_results.append(out)
 
-                loss_i = (pg_loss + kl_coef * kl) / valid_count
-                accelerator.backward(loss_i)
+            valid_count = len(rollout_results)
+            if valid_count == 0:
+                continue
 
-            step_loss_val += loss_i.item()
-            step_kl_val += kl.item()
+            # --- Compute rewards ---
+            rewards = []
+            for _, _, _, emo_pt, emo_turns in rollout_results:
+                r = _compute_emo_reward_scalar(
+                    emo_pt, emo_turns, reward_mode, w1, w2, w3, trend_n,
+                    step=global_step, S1=S1, S2=S2, warmup_steps=warmup_steps_reward,
+                )
+                rewards.append(r)
+
+            rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
+            r_mean = rewards_t.mean()
+            r_std = rewards_t.std().clamp(min=1e-6)
+            advantages = (rewards_t - r_mean) / r_std
+
+            # --- Accumulate gradients (scale loss by 1/grad_accum_steps) ---
+            actor.train()
+            is_last_accum = (_accum_idx == grad_accum_steps - 1)
+
+            for i, (full_ids, full_mask, resp_mask, _, _) in enumerate(rollout_results):
+                n_resp = resp_mask.sum().clamp(min=1)
+
+                is_last_in_group = (i == valid_count - 1)
+                should_sync = is_last_accum and is_last_in_group
+                sync_ctx = contextlib.nullcontext() if should_sync else accelerator.no_sync(actor)
+
+                with sync_ctx:
+                    actor_lp = _masked_log_probs(actor, full_ids, full_mask, resp_mask)
+                    with torch.no_grad():
+                        ref_lp = _masked_log_probs(ref_model, full_ids, full_mask, resp_mask)
+                        old_lp = actor_lp.detach()
+
+                    ratio = torch.exp(actor_lp - old_lp)
+                    adv = advantages[i]
+                    surr1 = ratio * adv
+                    surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * adv
+                    pg_loss = -(torch.minimum(surr1, surr2) * resp_mask).sum() / n_resp
+                    kl = ((old_lp - ref_lp) * resp_mask).sum() / n_resp
+
+                    loss_i = (pg_loss + kl_coef * kl) / (valid_count * grad_accum_steps)
+                    accelerator.backward(loss_i)
+
+                step_loss_val += loss_i.item()
+                step_kl_val += kl.item()
+
+            step_rewards_all.extend(rewards)
+            prompts_done += 1
+
+        if prompts_done == 0:
+            global_step += 1
+            continue
 
         accelerator.clip_grad_norm_(
             [p for p in accelerator.unwrap_model(actor).parameters() if p.requires_grad],
@@ -721,15 +773,16 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
         )
         optimizer.step()
 
+        agg_reward_mean = sum(step_rewards_all) / len(step_rewards_all)
         total_loss_acc += step_loss_val
-        total_reward_acc += r_mean.item()
+        total_reward_acc += agg_reward_mean
 
         monitor.log(step=global_step, metrics={
-            "reward_mean": r_mean.item(),
-            "rewards_max": max(rewards),
-            "rewards_min": min(rewards),
+            "reward_mean": agg_reward_mean,
+            "rewards_max": max(step_rewards_all),
+            "rewards_min": min(step_rewards_all),
             "loss": step_loss_val,
-            "kl_loss": step_kl_val / max(valid_count, 1),
+            "kl_loss": step_kl_val / max(len(step_rewards_all), 1),
         })
 
         global_step += 1
@@ -751,6 +804,10 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
                 ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
                 unwrapped.save_pretrained(ckpt_dir)
                 tokenizer.save_pretrained(ckpt_dir)
+                torch.save({
+                    "global_step": global_step,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                }, os.path.join(ckpt_dir, "training_state.pt"))
                 print(f"  [saved] {ckpt_dir}")
             if accelerator.is_main_process and save_total_limit > 0:
                 pattern = os.path.join(output_dir, "checkpoint-*")
@@ -765,5 +822,9 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
         final_dir = os.path.join(output_dir, "final")
         unwrapped.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)
+        torch.save({
+            "global_step": global_step,
+            "optimizer_state_dict": optimizer.state_dict(),
+        }, os.path.join(final_dir, "training_state.pt"))
         log_path = os.path.join(output_dir, "training_log.jsonl")
         print(f"[GRPO-Emo] 训练完成，模型已保存到 {final_dir}，指标日志: {log_path}")

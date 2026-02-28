@@ -147,14 +147,14 @@ class PPOMemory:
         log_probs, ref_log_probs, values, rewards, advantages, returns (when compute_gae=True).
         """
         out = {
-            "queries": self.queries,
-            "query_masks": self.query_masks,
-            "responses": self.responses,
-            "response_masks": self.response_masks,
-            "log_probs": self.log_probs,
-            "values": self.values,
-            "rewards": self.rewards,
-            "ref_log_probs": self.ref_log_probs,
+            "queries": list(self.queries),
+            "query_masks": list(self.query_masks),
+            "responses": list(self.responses),
+            "response_masks": list(self.response_masks),
+            "log_probs": list(self.log_probs),
+            "values": list(self.values),
+            "rewards": list(self.rewards),
+            "ref_log_probs": list(self.ref_log_probs),
         }
         if compute_gae:
             advantages, returns = self.compute_gae(last_value=last_value)

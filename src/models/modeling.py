@@ -92,10 +92,11 @@ def load_sft_model(
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_name,
             torch_dtype=torch_dtype,
-            device_map=device_map,
+            device_map="cpu",
         )
         model = PeftModel.from_pretrained(base_model, sft_model_path)
         model = model.merge_and_unload()
+        model = model.to(device_map.get("", 0) if isinstance(device_map, dict) else "cuda")
     else:
         tokenizer = AutoTokenizer.from_pretrained(sft_model_path, use_fast=True)
         if tokenizer.pad_token is None:

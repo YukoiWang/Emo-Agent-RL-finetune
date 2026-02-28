@@ -278,9 +278,10 @@ def collect_rollouts_emo(
     多轮对话 rollout + reward 计算 + 写入 memory。使用 planning_reply（LLM prompt）做情感分析。
     get_ref_log_probs_fn: (query_ids, query_mask, response_ids, response_mask) -> ref_log_probs (batch, resp_len)。
     mode3 时需传入 step, S1, S2, warmup_steps。
-    返回 (original_reward_tensor, penalized_reward_tensor) 供 trainer 记录。
+    返回 (original_reward_tensor, penalized_reward_tensor, component_stats) 供 trainer 记录。
+    component_stats: dict with baseline_mean, trend_mean, vol_mean。
     """
-    from .reward_emo import compute_reward_tensors
+    from .reward_emo import compute_reward_tensors, _trend_reward, _volatility_penalty
 
     gen_batch = run_multi_turn_rollout_batch(
         batch_items=batch_items,
@@ -331,6 +332,15 @@ def collect_rollouts_emo(
         else:
             rewards_scalar[i] = 0.0
 
+    import os
+    rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    print(
+        f"[rank{rank}] emo_points={emo_points} | "
+        f"resp_lengths={[int(gen_batch['response_mask'][i].sum().item()) for i in range(batch_size)]} | "
+        f"rewards={rewards_scalar.tolist()} | "
+        f"turns={emo_point_turns_list}"
+    )
+
     ref_log_probs = get_ref_log_probs_fn(
         gen_batch["query_ids"],
         gen_batch["query_mask"],
@@ -348,4 +358,18 @@ def collect_rollouts_emo(
         rewards_scalar,
         ref_log_probs,
     )
-    return original_reward_tensor, penalized_reward_tensor
+
+    baselines = [emo / 100.0 for emo in emo_points]
+    trends = []
+    vols = []
+    for i in range(len(emo_points)):
+        turns = emo_point_turns_list[i] if emo_point_turns_list and i < len(emo_point_turns_list) else [emo_points[i]]
+        trends.append(_trend_reward(turns, n=trend_n))
+        vols.append(_volatility_penalty(turns, n=trend_n))
+    component_stats = {
+        "baseline_mean": sum(baselines) / max(len(baselines), 1),
+        "trend_mean": sum(trends) / max(len(trends), 1),
+        "vol_mean": sum(vols) / max(len(vols), 1),
+    }
+
+    return original_reward_tensor, penalized_reward_tensor, component_stats

@@ -29,6 +29,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to RL config YAML file.",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint dir to resume training from (e.g. outputs/ppo_emo/checkpoint-500 or outputs/ppo_emo/final).",
+    )
     return parser.parse_args()
 
 
@@ -40,6 +46,9 @@ def main() -> None:
 
     with config_path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+
+    if args.resume:
+        cfg.setdefault("training", {})["resume_from_checkpoint"] = args.resume
 
     algo = cfg.get("rl", {}).get("algo", "ppo")
     if algo == "ppo":

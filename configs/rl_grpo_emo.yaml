@@ -3,7 +3,7 @@
 seed: 42
 
 model:
-  sft_model_path: "Qwen/Qwen2.5-1.5B-Instruct"
+  sft_model_path: "/home/ytwong/Emo-Agent-RL-finetune/Qwen2.5-1.5B-Instruct"
   dtype: "bfloat16"
   use_lora: true
 
@@ -11,14 +11,15 @@ data:
   data_dir: "data/data"
   train_file: "data/data/train_profile.jsonl"
   batch_size: 1
-  max_scene_len: 1500
+  max_scene_len: 800
 
 rollout:
-  max_turns: 8
+  max_turns: 4
   max_new_tokens_per_turn: 128
   use_planning_emo: true
-  planning_service_url: null
-  user_llm: "mock"
+  planning_service_url: "http://localhost:8765"
+  user_llm: "deepseek"
+  user_llm_model: "deepseek-chat"
   target: "eq"
   temperature: 0.8
   top_p: 0.95
@@ -27,9 +28,10 @@ rl:
   algo: "grpo_emo"
   grpo:
     num_generations: 4
-    learning_rate: 1.0e-6
+    learning_rate: 5.0e-6
     epsilon: 0.2
     beta: 0.02
+    gradient_accumulation_steps: 4
 
 reward:
   type: "emo"
@@ -42,15 +44,9 @@ reward:
   S2: 300
   warmup_steps: 200
 
-monitor:
-  use_tensorboard: true
-  use_wandb: true
-  wandb_project: "emo-rl"
-  experiment_name: "grpo_emo"
-
 training:
-  output_dir: "outputs/grpo_emo"
-  total_steps: 5000
-  logging_steps: 50
-  save_steps: 500
+  output_dir: "outputs/grpo_emo_mode1"
+  total_steps: 375
+  logging_steps: 10
+  save_steps: 100
   save_total_limit: 3

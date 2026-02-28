@@ -36,6 +36,7 @@ class TrainingMonitor:
         wandb_run_name: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
         enabled: bool = True,
+        resume: bool = False,
     ):
         self.enabled = enabled
         self._tb_writer = None
@@ -49,7 +50,7 @@ class TrainingMonitor:
 
         # --- JSONL ---
         log_path = os.path.join(output_dir, "training_log.jsonl")
-        self._log_file = open(log_path, "w", encoding="utf-8")
+        self._log_file = open(log_path, "a" if resume else "w", encoding="utf-8")
 
         # --- TensorBoard ---
         if use_tensorboard:
@@ -74,7 +75,7 @@ class TrainingMonitor:
             try:
                 import wandb
                 if wandb.run is None:
-                    wandb.init(
+                    init_kw = dict(
                         project=wandb_project or "emo-rl",
                         entity=wandb_entity,
                         name=wandb_run_name or experiment_name,
@@ -82,6 +83,9 @@ class TrainingMonitor:
                         dir=output_dir,
                         reinit=True,
                     )
+                    if resume:
+                        init_kw["resume"] = "allow"
+                    wandb.init(**init_kw)
                 self._wandb_run = wandb.run
                 print(f"[Monitor] wandb run → {wandb.run.url}")
             except ImportError:
@@ -128,13 +132,16 @@ class TrainingMonitor:
                 pass
 
     def close(self) -> None:
-        if self._log_file is not None:
-            self._log_file.close()
+        log_file = getattr(self, "_log_file", None)
+        if log_file is not None:
+            log_file.close()
             self._log_file = None
-        if self._tb_writer is not None:
-            self._tb_writer.close()
+        tb_writer = getattr(self, "_tb_writer", None)
+        if tb_writer is not None:
+            tb_writer.close()
             self._tb_writer = None
-        if self._wandb_run is not None:
+        wandb_run = getattr(self, "_wandb_run", None)
+        if wandb_run is not None:
             try:
                 import wandb
                 wandb.finish()
