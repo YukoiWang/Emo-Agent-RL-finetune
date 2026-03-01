@@ -133,6 +133,8 @@ def run_gspo_training(
     eps_low = rl_cfg.get("epsilon", 3e-4)
     eps_high = rl_cfg.get("epsilon_high", eps_low)
     kl_coef = rl_cfg.get("beta", 0.0)
+    entropy_coeff = rl_cfg.get("entropy_coeff", 0.0)
+    entropy_coeff = rl_cfg.get("entropy_coeff", 0.0)
     temperature = rl_cfg.get("temperature", 1.0)
     top_p = rl_cfg.get("top_p", 1.0)
     steps_per_gen = rl_cfg.get("steps_per_generation", 4)
@@ -219,6 +221,7 @@ def run_gspo_training(
             optimizer.zero_grad()
             policy_loss = torch.tensor(0.0, device=device)
             kl_loss_accum = torch.tensor(0.0, device=device)
+            entropy_loss_accum = torch.tensor(0.0, device=device)
 
             for j, i in enumerate(valid_indices):
                 full_ids, full_mask = cached_full[j]
@@ -238,11 +241,19 @@ def run_gspo_training(
                 surr2 = torch.clamp(s_i, 1.0 - eps_low, 1.0 + eps_high) * adv
                 policy_loss = policy_loss - torch.minimum(surr1, surr2)
 
+                # Monte Carlo entropy estimator over response tokens
+                entropy_i = (-actor_lp).mean()
+                entropy_loss_accum = entropy_loss_accum + entropy_i
+
                 log_ratio_ref = actor_lp - ref_lp[:min_len]
                 kl = (torch.exp(log_ratio_ref) - log_ratio_ref - 1).mean()
                 kl_loss_accum = kl_loss_accum + kl
 
-            loss = (policy_loss + kl_coef * kl_loss_accum) / (valid_count * steps_per_gen)
+            loss = (
+                policy_loss
+                + kl_coef * kl_loss_accum
+                - entropy_coeff * entropy_loss_accum
+            ) / (valid_count * steps_per_gen)
             accelerator.backward(loss)
 
             torch.nn.utils.clip_grad_norm_(
@@ -411,6 +422,7 @@ def run_gspo_emo_training(cfg: Dict[str, Any]) -> None:
     eps_low = rl_cfg.get("epsilon", 3e-4)
     eps_high = rl_cfg.get("epsilon_high", eps_low)
     kl_coef = rl_cfg.get("beta", 0.0)
+    entropy_coeff = rl_cfg.get("entropy_coeff", 0.0)
     steps_per_gen = rl_cfg.get("steps_per_generation", 4)
     temperature = rollout_cfg.get("temperature", 0.8)
     top_p = rollout_cfg.get("top_p", 0.95)
@@ -587,10 +599,17 @@ def run_gspo_emo_training(cfg: Dict[str, Any]) -> None:
                     surr2 = torch.clamp(s_i, 1.0 - eps_low, 1.0 + eps_high) * adv
                     pg_loss = -torch.minimum(surr1, surr2)
 
+                    # Monte Carlo entropy estimator over response tokens
+                    entropy_i = (-(actor_lp * resp_mask)).sum() / n_resp
+
                     log_ratio_ref = actor_lp - ref_lp
                     kl = (torch.exp(log_ratio_ref) - log_ratio_ref - 1).sum() / n_resp
 
-                    loss_i = (pg_loss + kl_coef * kl) / (total_count * steps_per_gen)
+                    loss_i = (
+                        pg_loss
+                        + kl_coef * kl
+                        - entropy_coeff * entropy_i
+                    ) / (total_count * steps_per_gen)
                     accelerator.backward(loss_i)
 
                 step_loss_total += loss_i.item()

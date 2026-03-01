@@ -167,38 +167,185 @@ def run_multi_turn_rollout_batch(
 ) -> Dict[str, Any]:
     """
     batch_items: 每项 {"profile", "prompt", "idx"}。
-    逐条跑 run_multi_turn_rollout_single，再 pad 成 batch。
+    并行多轮 rollout：一批对话共享 turn-loop，每一轮对所有未结束对话做一次 batched generate。
+
     返回 dict: query_ids, query_mask, response_ids, response_mask, log_probs, values,
                non_tensor_batch: { emo_point, emo_point_turns }。
     """
-    results = []
-    for item in batch_items:
-        out = run_multi_turn_rollout_single(
-            profile=item["profile"],
-            prompt=item["prompt"],
-            actor_ref=actor_ref,
-            critic=critic,
-            tokenizer=tokenizer,
-            user_llm_fn=user_llm_fn,
-            device=device,
-            max_turns=max_turns,
-            max_new_tokens_per_turn=max_new_tokens_per_turn,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_p=top_p,
-            target=item.get("target", target),
-            sft_model_path=sft_model_path,
-            planning_llm_fn=planning_llm_fn,
-        )
-        results.append(out)
-
-    # Pad 成 batch
     pad_id = getattr(tokenizer, "pad_token_id", tokenizer.eos_token_id)
-    q_list = [r[0].squeeze(0) for r in results]
-    r_list = [r[1].squeeze(0) for r in results]
-    m_list = [r[2].squeeze(0) for r in results]
-    lp_list = [r[3].squeeze(0) for r in results]
-    v_list = [r[4].squeeze(0) for r in results]
+    device = device or next(actor_ref.parameters(), T.tensor(0)).device  # type: ignore[arg-type]
+
+    batch_size = len(batch_items)
+
+    # 为每条对话构建独立的 PlayerSimulator，并初始化首轮 user 消息与初始 prompt
+    sims = []
+    init_query_list: List[T.Tensor] = []
+    init_query_mask_list: List[T.Tensor] = []
+    curr_query_list: List[T.Tensor] = []
+    curr_query_mask_list: List[T.Tensor] = []
+    turn_counts = [0 for _ in range(batch_size)]
+    done_flags = [False for _ in range(batch_size)]
+
+    for item in batch_items:
+        profile = item["profile"]
+        prompt = item["prompt"]
+
+        sim = build_player_simulator_with_planning(
+            profile=profile,
+            player_llm_fn=user_llm_fn,
+            planning_llm_fn=planning_llm_fn,
+            sft_model_path=sft_model_path,
+            target=target,
+            initial_emo_point=50.0,
+            device=str(device) if device else None,
+        )
+        first_user = sim.generate_first_message()
+        sim.dialog.append({"role": "user", "content": first_user})
+        sim.emo_point_turns = [sim.emo_point]
+        sims.append(sim)
+
+        initial_text = prompt.rstrip() + "\n\n用户：" + first_user + "\n\nNPC："
+        enc = tokenizer(
+            initial_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=2048,
+            padding=False,
+        )
+        q_ids = enc["input_ids"].to(device)
+        q_mask = enc.get("attention_mask")
+        if q_mask is not None:
+            q_mask = q_mask.to(device)
+        else:
+            q_mask = T.ones_like(q_ids, dtype=T.float32, device=device)
+
+        init_query_list.append(q_ids[0])
+        init_query_mask_list.append(q_mask[0])
+        curr_query_list.append(q_ids[0])
+        curr_query_mask_list.append(q_mask[0])
+
+    # 存储每条对话在所有轮次上的 NPC 回复与 value
+    all_resp_ids_list: List[List[T.Tensor]] = [[] for _ in range(batch_size)]
+    all_log_probs_list: List[List[T.Tensor]] = [[] for _ in range(batch_size)]
+    all_values_list: List[List[T.Tensor]] = [[] for _ in range(batch_size)]
+
+    # turn-level 并行 rollout
+    while True:
+        alive_indices = [
+            i for i in range(batch_size)
+            if (not done_flags[i]) and (turn_counts[i] < max_turns)
+        ]
+        if not alive_indices:
+            break
+
+        # 构建当前未结束对话的 batch 输入
+        lens = [curr_query_list[i].size(0) for i in alive_indices]
+        max_q = max(lens)
+        bsz_alive = len(alive_indices)
+        batch_q_ids = T.full(
+            (bsz_alive, max_q), pad_id, dtype=T.long, device=device,
+        )
+        batch_q_mask = T.zeros(
+            bsz_alive, max_q, dtype=T.float32, device=device,
+        )
+        for j, i in enumerate(alive_indices):
+            L = curr_query_list[i].size(0)
+            batch_q_ids[j, :L] = curr_query_list[i]
+            batch_q_mask[j, :L] = curr_query_mask_list[i]
+
+        # 一次 batched generate，为所有未结束对话生成 NPC 回复
+        resp_ids_batch, resp_mask_batch, log_probs_batch = actor_ref.generate(
+            batch_q_ids,
+            batch_q_mask,
+            max_new_tokens=max_new_tokens_per_turn,
+            do_sample=do_sample,
+            top_p=top_p,
+            temperature=temperature,
+        )
+
+        # 对每条对话分别更新 simulator / critic / query
+        for j, i in enumerate(alive_indices):
+            resp_ids = resp_ids_batch[j]
+            resp_mask = resp_mask_batch[j]
+            r_len = int(resp_mask.sum().item())
+
+            if r_len == 0:
+                done_flags[i] = True
+                continue
+
+            npc_reply = tokenizer.decode(resp_ids[:r_len], skip_special_tokens=True)
+            user_reply, done = sims[i].step(npc_reply)
+
+            all_resp_ids_list[i].append(resp_ids[:r_len])
+            all_log_probs_list[i].append(log_probs_batch[j, :r_len])
+
+            # critic 仍按单条对话 forward，生成 value 序列
+            full_ids = T.cat(
+                [curr_query_list[i].unsqueeze(0), resp_ids[:r_len].unsqueeze(0)],
+                dim=1,
+            )
+            full_attn = T.ones_like(full_ids, dtype=T.float32, device=device)
+            full_attn[:, : curr_query_list[i].size(0)] = curr_query_mask_list[i].unsqueeze(0)
+            full_attn[:, curr_query_list[i].size(0) :] = resp_mask[:r_len].unsqueeze(0)
+            with T.no_grad():
+                values_full = critic(full_ids, full_attn)
+            v_resp = values_full[0, -r_len:]
+            all_values_list[i].append(v_resp)
+
+            turn_counts[i] += 1
+            if done or turn_counts[i] >= max_turns:
+                done_flags[i] = True
+                continue
+
+            # 构建下一轮的 query：当前 full + 用户回复
+            next_suffix = "\n\n用户：" + user_reply + "\n\nNPC："
+            next_enc = tokenizer(
+                next_suffix,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+                padding=False,
+                add_special_tokens=False,
+            )
+            next_ids = next_enc["input_ids"].to(device)
+            next_mask = next_enc.get("attention_mask")
+            if next_mask is None:
+                next_mask = T.ones_like(next_ids, dtype=T.float32, device=device)
+            else:
+                next_mask = next_mask.to(device)
+
+            curr_query_list[i] = T.cat(
+                [full_ids[0], next_ids[0]],
+                dim=0,
+            )
+            curr_query_mask_list[i] = T.cat(
+                [full_attn[0], next_mask[0]],
+                dim=0,
+            )
+
+    # 将每条对话的多轮回复拼接，并 pad 成 batch
+    q_list = [q for q in init_query_list]
+    q_mask_list = [m for m in init_query_mask_list]
+    r_list: List[T.Tensor] = []
+    lp_list: List[T.Tensor] = []
+    v_list: List[T.Tensor] = []
+    emo_points: List[float] = []
+    emo_point_turns_list: List[List[float]] = []
+
+    for i in range(batch_size):
+        if not all_resp_ids_list[i]:
+            resp = T.zeros(1, dtype=T.long, device=device)
+            lp = T.zeros(1, dtype=T.float32, device=device)
+            val = T.zeros(1, dtype=T.float32, device=device)
+        else:
+            resp = T.cat(all_resp_ids_list[i], dim=0)
+            lp = T.cat(all_log_probs_list[i], dim=0)
+            val = T.cat(all_values_list[i], dim=0)
+        r_list.append(resp)
+        lp_list.append(lp)
+        v_list.append(val)
+        emo_points.append(float(sims[i].get_emo_point()))
+        emo_point_turns_list.append(list(sims[i].get_emo_point_turns()))
 
     max_q = max(t.size(0) for t in q_list)
     max_r = max(t.size(0) for t in r_list)
@@ -218,7 +365,7 @@ def run_multi_turn_rollout_batch(
     query_mask = T.zeros(len(q_list), max_q, dtype=T.float32, device=device)
     for i, t in enumerate(q_list):
         query_ids[i, : t.size(0)] = t
-        query_mask[i, : t.size(0)] = 1.0
+        query_mask[i, : t.size(0)] = q_mask_list[i]
 
     response_ids = T.full((len(r_list), max_r), pad_id, dtype=T.long, device=device)
     response_mask = T.zeros(len(r_list), max_r, dtype=T.float32, device=device)
@@ -228,9 +375,6 @@ def run_multi_turn_rollout_batch(
 
     log_probs, _ = _pad_to(lp_list, max_r, 0.0)
     values, _ = _pad_to(v_list, max_r, 0.0)
-
-    emo_points = [float(r[5]) for r in results]
-    emo_point_turns_list = [list(r[6]) for r in results]
 
     return {
         "query_ids": query_ids,

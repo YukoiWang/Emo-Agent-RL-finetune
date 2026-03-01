@@ -228,7 +228,17 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         lr=critic_lr,
     )
 
-    # ---------- 4b. Accelerate prepare（多卡时自动 DDP）----------
+    # ---------- 4b. DEBUG: 检查各 rank 模型参数（DDP 要求一致）----------
+    n_actor = sum(p.numel() for p in actor_ref.parameters())
+    n_actor_train = sum(p.numel() for p in actor_ref.parameters_for_optimizer())
+    n_critic = sum(p.numel() for p in critic.parameters())
+    n_critic_train = sum(p.numel() for p in critic.parameters() if p.requires_grad)
+    print(
+        f"[PPO-Emo][rank={accelerator.process_index}] actor: total={n_actor}, trainable={n_actor_train} | "
+        f"critic: total={n_critic}, trainable={n_critic_train}"
+    )
+    accelerator.wait_for_everyone()
+    # ---------- 4c. Accelerate prepare（多卡时自动 DDP）----------
     actor_ref, critic, actor_optimizer, critic_optimizer, dataloader = accelerator.prepare(
         actor_ref, critic, actor_optimizer, critic_optimizer, dataloader
     )

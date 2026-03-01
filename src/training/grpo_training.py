@@ -174,12 +174,14 @@ def run_grpo_training(
     lr = rl_cfg.get("learning_rate", 1e-6)
     epsilon = rl_cfg.get("epsilon", 0.2)
     kl_coef = rl_cfg.get("beta", 0.02)
+    entropy_coeff = rl_cfg.get("entropy_coeff", 0.0)
     temperature = rl_cfg.get("temperature", 1.0)
     top_p = rl_cfg.get("top_p", 1.0)
     total_steps = training_cfg.get("total_steps", 100)
     logging_steps = training_cfg.get("logging_steps", 10)
     save_steps = training_cfg.get("save_steps", 500)
     output_dir = training_cfg.get("output_dir", "outputs/grpo")
+    max_grad_norm = rl_cfg.get("max_grad_norm", 1.0)
 
     # -- Optimizer & Accelerate prepare（多卡时自动 DDP）--
     optimizer = torch.optim.AdamW(
@@ -232,16 +234,32 @@ def run_grpo_training(
                 temperature=temperature, top_p=top_p,
             )
 
+            # 标量 reward -> token 级 reward 展开（只在最后一个 token 上放置 outcome reward），
+            # 再按组做标准化，得到 GRPO advantage。
             rewards = reward_fn(resp_texts)
             rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
-
-            r_mean = rewards_t.mean()
-            r_std = rewards_t.std().clamp(min=1e-6)
-            advantages = (rewards_t - r_mean) / r_std
+            if len(resp_ids_list) > 0:
+                max_resp_len = max(r.size(0) for r in resp_ids_list)
+            else:
+                max_resp_len = 0
+            token_level_rewards = torch.zeros(
+                num_generations, max_resp_len, dtype=torch.float32, device=device,
+            )
+            for i, resp in enumerate(resp_ids_list):
+                L = resp.size(0)
+                if L > 0:
+                    # 将该条回复的 outcome reward 放到最后一个有效 token 上
+                    token_level_rewards[i, L - 1] = rewards_t[i]
+            # 每条回复的总 reward（与 rewards_t 等价）做组内标准化
+            scores = token_level_rewards.sum(dim=-1)
+            r_mean = scores.mean()
+            r_std = scores.std().clamp(min=1e-6)
+            advantages = (scores - r_mean) / r_std
 
             actor.train()
             policy_loss = torch.tensor(0.0, device=device)
             kl_loss_accum = torch.tensor(0.0, device=device)
+            entropy_loss_accum = torch.tensor(0.0, device=device)
             valid_count = 0
 
             for i in range(num_generations):
@@ -267,6 +285,10 @@ def run_grpo_training(
                 surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * adv
                 policy_loss = policy_loss - torch.minimum(surr1, surr2).mean()
 
+                # Monte Carlo entropy estimator: E[-log π(a)] ≈ mean_t(-log π(a_t))
+                entropy_i = (-actor_lp).mean()
+                entropy_loss_accum = entropy_loss_accum + entropy_i
+
                 _kl_ratio = actor_lp - ref_lp
                 kl = (torch.exp(_kl_ratio) - _kl_ratio - 1).mean()
                 kl_loss_accum = kl_loss_accum + kl
@@ -274,7 +296,11 @@ def run_grpo_training(
                 valid_count += 1
 
             if valid_count > 0:
-                loss = (policy_loss + kl_coef * kl_loss_accum) / (valid_count * grad_accum_steps)
+                loss = (
+                    policy_loss
+                    + kl_coef * kl_loss_accum
+                    - entropy_coeff * entropy_loss_accum
+                ) / (valid_count * grad_accum_steps)
                 accelerator.backward(loss)
                 step_loss_val += loss.item()
                 step_kl_val += (kl_loss_accum / valid_count).item()
@@ -286,7 +312,7 @@ def run_grpo_training(
             continue
 
         torch.nn.utils.clip_grad_norm_(
-            [p for p in actor.parameters() if p.requires_grad], 1.0,
+            [p for p in actor.parameters() if p.requires_grad], max_grad_norm,
         )
         optimizer.step()
 
@@ -619,6 +645,8 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
     lr = rl_cfg.get("learning_rate", 1e-6)
     epsilon = rl_cfg.get("epsilon", 0.2)
     kl_coef = rl_cfg.get("beta", 0.02)
+    entropy_coeff = rl_cfg.get("entropy_coeff", 0.0)
+    max_grad_norm = rl_cfg.get("max_grad_norm", 1.0)
     temperature = rollout_cfg.get("temperature", 0.8)
     top_p = rollout_cfg.get("top_p", 0.95)
     max_turns = rollout_cfg.get("max_turns", 8)
@@ -760,10 +788,16 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
                     surr1 = ratio * adv
                     surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * adv
                     pg_loss = -(torch.minimum(surr1, surr2) * resp_mask).sum() / n_resp
+                    # Monte Carlo entropy estimator on response tokens
+                    entropy_i = (-(actor_lp * resp_mask)).sum() / n_resp
                     _kl_ratio = actor_lp - ref_lp
                     kl = ((torch.exp(_kl_ratio) - _kl_ratio - 1) * resp_mask).sum() / n_resp
 
-                    loss_i = (pg_loss + kl_coef * kl) / (valid_count * grad_accum_steps)
+                    loss_i = (
+                        pg_loss
+                        + kl_coef * kl
+                        - entropy_coeff * entropy_i
+                    ) / (valid_count * grad_accum_steps)
                     accelerator.backward(loss_i)
 
                 step_loss_val += loss_i.item()
@@ -778,7 +812,7 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
 
         accelerator.clip_grad_norm_(
             [p for p in accelerator.unwrap_model(actor).parameters() if p.requires_grad],
-            1.0,
+            max_grad_norm,
         )
         optimizer.step()
 
