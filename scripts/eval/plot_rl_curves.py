@@ -3,24 +3,20 @@
 """
 Plot RL training curves from training_log.jsonl files.
 
-Supports:
-  - Auto-discovery: any sub-directory containing training_log.jsonl is treated
-    as an experiment.
-  - Single-experiment mode: point --log-dir directly at a dir with the jsonl.
-  - Metrics: reward, loss, kl, policy_loss, value_loss, rewards_max/min.
-  - Exponential smoothing (--smooth).
-  - High-DPI export (--dpi, default 300).
-  - Combined multi-panel figure + individual per-metric PNGs.
+Supports both PPO-Emo and GRPO log formats:
+
+  PPO-Emo fields:
+    reward_mean, actor/pg_loss, actor/entropy_loss, actor/kl_loss,
+    actor/policy_loss, actor/pg_clipfrac, actor/ppo_kl, actor/grad_norm,
+    critic/vf_loss, critic/vf_clipfrac, critic/vpred_mean, critic/grad_norm,
+    baseline_mean, trend_mean, vol_mean, elapsed
+
+  GRPO fields:
+    reward_mean, rewards_max, rewards_min, loss, kl_loss
 
 Usage:
-  # Multi-experiment comparison (auto-discovers sub-dirs)
   python scripts/eval/plot_rl_curves.py --log-dir outputs/
-
-  # Single experiment
-  python scripts/eval/plot_rl_curves.py --log-dir outputs/grpo_emo
-
-  # Custom output dir & smoothing
-  python scripts/eval/plot_rl_curves.py --log-dir outputs/ --out-dir figures/ --smooth 10 --dpi 300
+  python scripts/eval/plot_rl_curves.py --log-dir outputs/ppo_emo --smooth 10
 """
 import argparse
 import json
@@ -43,13 +39,30 @@ plt.rcParams.update({
     "grid.alpha": 0.3,
 })
 
+# (title, candidate_keys, ylabel)
+# candidate_keys: the first matching key in a record is used.
 METRIC_GROUPS: List[Tuple[str, List[str], str]] = [
-    ("Reward (mean)", ["reward_mean"], "Reward"),
-    ("Loss", ["loss", "total_loss"], "Loss"),
-    ("KL Divergence", ["kl_loss", "objective/kl", "policy/approxkl_avg"], "KL"),
-    ("Policy Loss", ["policy_loss"], "Policy Loss"),
-    ("Value Loss", ["value_loss"], "Value Loss"),
-    ("Reward Range", ["rewards_max", "rewards_min"], "Reward Range"),
+    # ── shared ──
+    ("Reward (mean)",       ["reward_mean"],                                        "Reward"),
+    ("Reward Range",        ["rewards_max", "rewards_min"],                         "Reward Range"),
+    # ── loss (covers both PPO-Emo and GRPO) ──
+    ("Policy Loss",         ["actor/policy_loss", "actor/pg_loss", "loss"],          "Loss"),
+    ("Value Loss",          ["critic/vf_loss"],                                     "Loss"),
+    # ── KL ──
+    ("KL Divergence",       ["actor/kl_loss", "kl_loss"],                           "KL"),
+    ("PPO Approx KL",       ["actor/ppo_kl"],                                       "KL"),
+    # ── PPO-Emo specific ──
+    ("Entropy",             ["actor/entropy_loss"],                                 "Entropy"),
+    ("PG Clip Fraction",    ["actor/pg_clipfrac"],                                  "Fraction"),
+    ("VF Clip Fraction",    ["critic/vf_clipfrac"],                                 "Fraction"),
+    ("Critic V-pred",       ["critic/vpred_mean"],                                  "Value"),
+    # ── reward components (PPO-Emo mode2/3) ──
+    ("Reward: Baseline",    ["baseline_mean"],                                      "Score"),
+    ("Reward: Trend",       ["trend_mean"],                                         "Score"),
+    ("Reward: Volatility",  ["vol_mean"],                                           "Score"),
+    # ── grad norms ──
+    ("Actor Grad Norm",     ["actor/grad_norm"],                                    "Norm"),
+    ("Critic Grad Norm",    ["critic/grad_norm"],                                   "Norm"),
 ]
 
 
@@ -78,6 +91,18 @@ def find_experiments(log_dir: Path) -> Dict[str, List[Dict[str, Any]]]:
         experiments[label] = load_jsonl(jsonl)
 
     return experiments
+
+
+def detect_trainer_type(records: List[Dict]) -> str:
+    """Guess 'ppo' or 'grpo' from logged keys."""
+    if not records:
+        return "unknown"
+    sample = records[min(5, len(records) - 1)]
+    if "actor/pg_loss" in sample or "actor/policy_loss" in sample:
+        return "ppo"
+    if "loss" in sample and "rewards_max" in sample:
+        return "grpo"
+    return "unknown"
 
 
 def extract(records: List[Dict], key_candidates: List[str]) -> Tuple[np.ndarray, np.ndarray]:
@@ -123,8 +148,7 @@ def plot_single_metric(
             continue
         color = colors[i % len(colors)] if colors else f"C{i}"
         if smooth > 0:
-            raw_alpha = 0.2
-            ax.plot(steps, vals, color=color, alpha=raw_alpha, linewidth=0.5)
+            ax.plot(steps, vals, color=color, alpha=0.2, linewidth=0.5)
             vals = ema_smooth(vals, smooth)
         ax.plot(steps, vals, label=label, color=color, linewidth=1.5)
         plotted = True
@@ -173,19 +197,58 @@ def plot_reward_range(
     return plotted
 
 
+def plot_reward_components(
+    ax: plt.Axes,
+    experiments: Dict[str, List[Dict]],
+    smooth: float = 0,
+):
+    """Overlay baseline / trend / volatility on a single axis."""
+    component_keys = [
+        ("baseline_mean", "Baseline", "#2196F3"),
+        ("trend_mean", "Trend", "#4CAF50"),
+        ("vol_mean", "Volatility", "#FF5722"),
+    ]
+    plotted = False
+    for label, records in experiments.items():
+        for key, comp_label, color in component_keys:
+            steps, vals = extract(records, [key])
+            if len(steps) == 0:
+                continue
+            if smooth > 0:
+                ax.plot(steps, vals, color=color, alpha=0.15, linewidth=0.4)
+                vals = ema_smooth(vals, smooth)
+            suffix = f" ({label})" if len(experiments) > 1 else ""
+            ax.plot(steps, vals, label=f"{comp_label}{suffix}",
+                    color=color, linewidth=1.5)
+            plotted = True
+
+    if plotted:
+        ax.set_xlabel("Step")
+        ax.set_ylabel("Component Score")
+        ax.legend(loc="best")
+    return plotted
+
+
+def has_any_key(records: List[Dict], keys: List[str]) -> bool:
+    """Check if at least one record contains any of the keys."""
+    for r in records[:20]:
+        for k in keys:
+            if k in r:
+                return True
+    return False
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Plot RL training curves (high-quality)")
+    parser = argparse.ArgumentParser(description="Plot RL training curves")
     parser.add_argument("--log-dir", type=str, default="outputs",
                         help="Root dir (auto-discovers sub-dirs) or single experiment dir")
     parser.add_argument("--out-dir", type=str, default=None,
                         help="Output dir for figures (default: <log-dir>/plots)")
     parser.add_argument("--smooth", type=float, default=10,
                         help="EMA smoothing span (0=no smoothing)")
-    parser.add_argument("--dpi", type=int, default=300,
-                        help="Output DPI for saved figures")
+    parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--format", type=str, default="png",
-                        choices=["png", "pdf", "svg"],
-                        help="Output figure format")
+                        choices=["png", "pdf", "svg"])
     args = parser.parse_args()
 
     log_dir = Path(args.log_dir)
@@ -198,11 +261,23 @@ def main():
         return
 
     print(f"Found {len(experiments)} experiment(s): {list(experiments.keys())}")
+    for label, records in experiments.items():
+        ttype = detect_trainer_type(records)
+        print(f"  {label}: {len(records)} steps, type={ttype}")
 
     colors = [f"C{i}" for i in range(10)]
 
-    # --- Individual metric plots ---
+    # Gather all keys present across experiments to decide what to plot
+    all_records = []
+    for records in experiments.values():
+        all_records.extend(records[:20])
+
+    # ── Individual metric plots ──
+    saved_count = 0
     for title, keys, ylabel in METRIC_GROUPS:
+        if not has_any_key(all_records, keys):
+            continue
+
         fig, ax = plt.subplots(figsize=(9, 4.5))
 
         if "Range" in title:
@@ -212,33 +287,67 @@ def main():
 
         if plotted:
             ax.set_title(title)
-            fname = title.lower().replace(" ", "_").replace("(", "").replace(")", "")
+            fname = title.lower().replace(" ", "_").replace("(", "").replace(")", "").replace(":", "").replace("-", "")
             path = out_dir / f"{fname}.{args.format}"
             fig.savefig(path, dpi=args.dpi)
             print(f"  Saved {path}")
+            saved_count += 1
         plt.close(fig)
 
-    # --- Combined multi-panel figure ---
-    core_metrics = [
-        ("Reward (mean)", ["reward_mean"], "Reward"),
-        ("Loss", ["loss", "total_loss"], "Loss"),
-        ("KL Divergence", ["kl_loss", "objective/kl"], "KL"),
+    # ── Reward components combined plot (PPO-Emo) ──
+    if has_any_key(all_records, ["baseline_mean"]):
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        plotted = plot_reward_components(ax, experiments, args.smooth)
+        if plotted:
+            ax.set_title("Reward Components (Baseline / Trend / Volatility)")
+            path = out_dir / f"reward_components.{args.format}"
+            fig.savefig(path, dpi=args.dpi)
+            print(f"  Saved {path}")
+            saved_count += 1
+        plt.close(fig)
+
+    # ── Combined multi-panel overview ──
+    # Adaptive: pick the metrics that actually exist
+    overview_candidates = [
+        ("Reward",          ["reward_mean"],                               "Reward"),
+        ("Policy Loss",     ["actor/policy_loss", "actor/pg_loss", "loss"],"Loss"),
+        ("KL",              ["actor/kl_loss", "kl_loss"],                  "KL"),
+        ("Value Loss",      ["critic/vf_loss"],                            "Loss"),
+        ("Entropy",         ["actor/entropy_loss"],                        "Entropy"),
+        ("Reward Components", ["baseline_mean"],                           ""),
     ]
-    fig, axes = plt.subplots(1, len(core_metrics), figsize=(6 * len(core_metrics), 4.5))
-    if len(core_metrics) == 1:
-        axes = [axes]
-    for ax, (title, keys, ylabel) in zip(axes, core_metrics):
-        plot_single_metric(ax, experiments, keys, ylabel, args.smooth, colors)
-        ax.set_title(title)
+    core = [(t, k, y) for t, k, y in overview_candidates if has_any_key(all_records, k)]
+    if core:
+        n_panels = min(len(core), 6)
+        core = core[:n_panels]
+        cols = min(n_panels, 3)
+        rows = (n_panels + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4.5 * rows))
+        if n_panels == 1:
+            axes = [axes]
+        else:
+            axes = axes.flatten() if hasattr(axes, "flatten") else [axes]
 
-    fig.suptitle("RL Training Overview", fontsize=14, y=1.02)
-    fig.tight_layout()
-    combined_path = out_dir / f"training_overview.{args.format}"
-    fig.savefig(combined_path, dpi=args.dpi)
-    plt.close(fig)
-    print(f"  Saved {combined_path}")
+        for idx, (title, keys, ylabel) in enumerate(core):
+            ax = axes[idx]
+            if title == "Reward Components":
+                plot_reward_components(ax, experiments, args.smooth)
+            else:
+                plot_single_metric(ax, experiments, keys, ylabel, args.smooth, colors)
+            ax.set_title(title)
 
-    print(f"\nAll figures saved to {out_dir.absolute()}")
+        for idx in range(len(core), len(axes)):
+            axes[idx].set_visible(False)
+
+        fig.suptitle("RL Training Overview", fontsize=14, y=1.02)
+        fig.tight_layout()
+        combined_path = out_dir / f"training_overview.{args.format}"
+        fig.savefig(combined_path, dpi=args.dpi)
+        plt.close(fig)
+        print(f"  Saved {combined_path}")
+        saved_count += 1
+
+    print(f"\n{saved_count} figures saved to {out_dir.absolute()}")
 
 
 if __name__ == "__main__":
