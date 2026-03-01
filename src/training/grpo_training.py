@@ -620,24 +620,15 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=lambda x: x)
 
     # ---------- 3. User simulator & planning (same as PPO-Emo) ----------
+    # Planning: prefer API (planning_service_url / planning_llm); on failure fallback to local (rank 0 only). API path does not load local planner.
     user_llm_fn = _build_user_llm_fn(cfg)
-    planning_service_url = rollout_cfg.get("planning_service_url")
-    planning_llm_kind = rollout_cfg.get("planning_llm")
+    from .local_planning_llm import build_planning_llm_fn_prefer_api_then_local
+    planning_llm_fn = build_planning_llm_fn_prefer_api_then_local(
+        rollout_cfg, model_cfg, device,
+        process_index=accelerator.process_index,
+        world_size=accelerator.num_processes,
+    )
     sft_model_path = model_cfg.get("sft_model_path")
-    if planning_service_url:
-        from .planning_service_client import build_planning_service_llm_fn
-        planning_llm_fn = build_planning_service_llm_fn(planning_service_url)
-    elif planning_llm_kind in ("deepseek", "qwen", "openai"):
-        from .qwen_user_simulator import build_qwen_user_llm_fn
-        planning_llm_fn = build_qwen_user_llm_fn(
-            model=rollout_cfg.get("planning_llm_model", "deepseek-chat"),
-            temperature=rollout_cfg.get("planning_llm_temperature", 0.5),
-        )
-    elif sft_model_path:
-        from .local_planning_llm import build_local_planning_llm_fn
-        planning_llm_fn = build_local_planning_llm_fn(sft_model_path, device=device)
-    else:
-        planning_llm_fn = None
     target = rollout_cfg.get("target", "eq")
 
     # ---------- 4. GRPO hyper-params ----------

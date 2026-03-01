@@ -180,24 +180,15 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
     )
 
     # ---------- 3. 用户模拟与情感（使用 planning_reply） ----------
+    # Planning：优先 API（planning_service_url / planning_llm），失败再回退本地；用 API 时不会加载本地 planner。
     user_llm_fn = _build_user_llm_fn(cfg)
-    planning_service_url = rollout_cfg.get("planning_service_url")
-    planning_llm_kind = rollout_cfg.get("planning_llm")
+    from src.training.local_planning_llm import build_planning_llm_fn_prefer_api_then_local
+    planning_llm_fn = build_planning_llm_fn_prefer_api_then_local(
+        rollout_cfg, model_cfg, device,
+        process_index=accelerator.process_index,
+        world_size=accelerator.num_processes,
+    )
     sft_model_path = model_cfg.get("sft_model_path")
-    if planning_service_url:
-        from src.training.planning_service_client import build_planning_service_llm_fn
-        planning_llm_fn = build_planning_service_llm_fn(planning_service_url)
-    elif planning_llm_kind in ("deepseek", "qwen", "openai"):
-        from src.training.qwen_user_simulator import build_qwen_user_llm_fn
-        planning_llm_fn = build_qwen_user_llm_fn(
-            model=rollout_cfg.get("planning_llm_model", "deepseek-chat"),
-            temperature=rollout_cfg.get("planning_llm_temperature", 0.5),
-        )
-    elif sft_model_path:
-        from src.training.local_planning_llm import build_local_planning_llm_fn
-        planning_llm_fn = build_local_planning_llm_fn(sft_model_path, device=device)
-    else:
-        planning_llm_fn = None
     target_default = rollout_cfg.get("target", "eq")
 
     # ---------- 4. Memory / ref_log_probs / optimizer ----------
