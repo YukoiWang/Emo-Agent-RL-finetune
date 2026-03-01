@@ -99,6 +99,7 @@ def load_sft_model(
         model = model.to(device_map.get("", 0) if isinstance(device_map, dict) else "cuda")
     else:
         tokenizer = AutoTokenizer.from_pretrained(sft_model_path, use_fast=True)
+        tokenizer.padding_side = "left" 
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 

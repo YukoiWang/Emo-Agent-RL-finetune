@@ -37,6 +37,7 @@ def build_local_planning_llm_fn(
         return _fn_no_model
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer.padding_side = "left" 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
