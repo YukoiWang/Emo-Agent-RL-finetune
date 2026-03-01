@@ -861,7 +861,8 @@ class PPOTrainer:
 
             entropy_loss = (entropy_resp * adv_mask).sum() / n_valid
 
-            kl_loss = ((new_log_probs_resp - ref_log_probs) * adv_mask).sum() / n_valid
+            _kl_ratio = new_log_probs_resp - ref_log_probs
+            kl_loss = ((T.exp(_kl_ratio) - _kl_ratio - 1) * adv_mask).sum() / n_valid
 
             policy_loss = pg_loss - self.entropy_coeff * entropy_loss + self.kl_coef * kl_loss
 

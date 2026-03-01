@@ -182,10 +182,17 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
     # ---------- 3. 用户模拟与情感（使用 planning_reply） ----------
     user_llm_fn = _build_user_llm_fn(cfg)
     planning_service_url = rollout_cfg.get("planning_service_url")
+    planning_llm_kind = rollout_cfg.get("planning_llm")
     sft_model_path = model_cfg.get("sft_model_path")
     if planning_service_url:
         from src.training.planning_service_client import build_planning_service_llm_fn
         planning_llm_fn = build_planning_service_llm_fn(planning_service_url)
+    elif planning_llm_kind in ("deepseek", "qwen", "openai"):
+        from src.training.qwen_user_simulator import build_qwen_user_llm_fn
+        planning_llm_fn = build_qwen_user_llm_fn(
+            model=rollout_cfg.get("planning_llm_model", "deepseek-chat"),
+            temperature=rollout_cfg.get("planning_llm_temperature", 0.5),
+        )
     elif sft_model_path:
         from src.training.local_planning_llm import build_local_planning_llm_fn
         planning_llm_fn = build_local_planning_llm_fn(sft_model_path, device=device)
@@ -480,7 +487,8 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
 
                 pg_loss = -(T.minimum(surr1, surr2) * adv_mask).sum() / valid_count
                 entropy_loss = (entropy_resp * adv_mask).sum() / valid_count
-                kl_loss = ((new_lp_resp - ref_log_probs) * adv_mask).sum() / valid_count
+                _kl_ratio = new_lp_resp - ref_log_probs
+                kl_loss = ((T.exp(_kl_ratio) - _kl_ratio - 1) * adv_mask).sum() / valid_count
                 policy_loss = pg_loss - entropy_coeff * entropy_loss + kl_coef * kl_loss
 
                 actor_optimizer.zero_grad()

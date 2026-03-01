@@ -53,14 +53,17 @@ def main() -> None:
     algo = cfg.get("rl", {}).get("algo", "ppo")
     if algo == "ppo":
         run_ppo_emo_training(cfg)
-    elif algo == "grpo":
+    elif algo in ("grpo", "grpo_emo"):
         from src.training.grpo_training import run_grpo_emo_training
         run_grpo_emo_training(cfg)
+    elif algo in ("gspo", "gspo_emo"):
+        from src.training.gspo_training import run_gspo_emo_training
+        run_gspo_emo_training(cfg)
     elif algo == "dpo_emo":
         from src.training.dpo_emo_trainer import run_dpo_emo_training
         run_dpo_emo_training(cfg)
     else:
-        raise ValueError(f"不支持的 RL 算法: {algo}，当前支持 ppo, grpo, grpo_emo, dpo_emo")
+        raise ValueError(f"不支持的 RL 算法: {algo}，当前支持 ppo, grpo, grpo_emo, gspo, gspo_emo, dpo_emo")
 
 
 if __name__ == "__main__":

@@ -267,7 +267,8 @@ def run_grpo_training(
                 surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * adv
                 policy_loss = policy_loss - torch.minimum(surr1, surr2).mean()
 
-                kl = (old_lp - ref_lp).mean()
+                _kl_ratio = actor_lp - ref_lp
+                kl = (torch.exp(_kl_ratio) - _kl_ratio - 1).mean()
                 kl_loss_accum = kl_loss_accum + kl
 
                 valid_count += 1
@@ -595,10 +596,17 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
     # ---------- 3. User simulator & planning (same as PPO-Emo) ----------
     user_llm_fn = _build_user_llm_fn(cfg)
     planning_service_url = rollout_cfg.get("planning_service_url")
+    planning_llm_kind = rollout_cfg.get("planning_llm")
     sft_model_path = model_cfg.get("sft_model_path")
     if planning_service_url:
         from .planning_service_client import build_planning_service_llm_fn
         planning_llm_fn = build_planning_service_llm_fn(planning_service_url)
+    elif planning_llm_kind in ("deepseek", "qwen", "openai"):
+        from .qwen_user_simulator import build_qwen_user_llm_fn
+        planning_llm_fn = build_qwen_user_llm_fn(
+            model=rollout_cfg.get("planning_llm_model", "deepseek-chat"),
+            temperature=rollout_cfg.get("planning_llm_temperature", 0.5),
+        )
     elif sft_model_path:
         from .local_planning_llm import build_local_planning_llm_fn
         planning_llm_fn = build_local_planning_llm_fn(sft_model_path, device=device)
@@ -752,7 +760,8 @@ def run_grpo_emo_training(cfg: Dict[str, Any]) -> None:
                     surr1 = ratio * adv
                     surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * adv
                     pg_loss = -(torch.minimum(surr1, surr2) * resp_mask).sum() / n_resp
-                    kl = ((old_lp - ref_lp) * resp_mask).sum() / n_resp
+                    _kl_ratio = actor_lp - ref_lp
+                    kl = ((torch.exp(_kl_ratio) - _kl_ratio - 1) * resp_mask).sum() / n_resp
 
                     loss_i = (pg_loss + kl_coef * kl) / (valid_count * grad_accum_steps)
                     accelerator.backward(loss_i)
