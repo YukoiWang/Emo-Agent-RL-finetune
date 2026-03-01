@@ -114,8 +114,9 @@ def build_planning_llm_fn_prefer_api_then_local(
             temperature=rollout_cfg.get("planning_llm_temperature", 0.5),
         )
 
-    # 2) 本地作为回退：仅在有 sft_model_path 时构建，且只让 rank 0 加载
-    if sft_model_path:
+    # 2) 本地作为回退：仅在有 sft_model_path 时构建，且只让 rank 0 加载。
+    #    多卡时非 rank 0 不建 local_fn，避免 API 失败时 fallback 到会报错的 stub。
+    if sft_model_path and (world_size <= 1 or process_index == 0):
         local_fn = build_local_planning_llm_fn(
             sft_model_path,
             device=device,
