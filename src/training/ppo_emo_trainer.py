@@ -96,7 +96,7 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
     """
     import datetime
     nccl_timeout_min = cfg.get("training", {}).get("nccl_timeout_minutes", 30)
-    os.environ.setdefault("NCCL_BLOCKING_WAIT", "0")
+    os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "0")
     os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 
     seed = cfg.get("seed", 42)
@@ -380,7 +380,16 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         # that the slower rank hasn't reached yet → NCCL timeout.
         accelerator.wait_for_everyone()
 
-        if len(memory) == 0:
+        # All ranks must agree: if any rank has empty buffer, all skip the update.
+        # Otherwise one rank would continue to next iter and miss all_reduce / DDP
+        # below → collective timeout (rank 0 in BROADCAST, others in ALLGATHER).
+        if accelerator.num_processes > 1:
+            has_data = T.tensor([1.0 if len(memory) > 0 else 0.0], device=device)
+            T.distributed.all_reduce(has_data, op=T.distributed.ReduceOp.MIN)
+            if has_data.item() == 0.0:
+                global_step += 1
+                continue
+        elif len(memory) == 0:
             global_step += 1
             continue
 
