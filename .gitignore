@@ -9,6 +9,12 @@ eval_tmp_base/
 *.bin
 *.safetensors
 
+# 训练/评估输出，不提交到 GitHub
+outputs/
+
+# 主目录下所有 jsonl 数据/日志，不提交到 GitHub
+/*.jsonl
+
 # Python
 __pycache__/
 *.py[cod]
