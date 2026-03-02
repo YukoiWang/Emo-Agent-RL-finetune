@@ -434,6 +434,8 @@ def _run_multiturn_grpo_rollout(
         initial_emo_point=50.0,
         device=str(device) if device else None,
     )
+    # user_llm is an external API; if it fails (e.g., insufficient balance),
+    # the simulator will fall back to a default first message.
     first_user = sim.generate_first_message()
     sim.dialog.append({"role": "user", "content": first_user})
     sim.emo_point_turns = [sim.emo_point]
@@ -470,6 +472,7 @@ def _run_multiturn_grpo_rollout(
         response_ranges.append((resp_start, resp_end))
 
         npc_reply = tokenizer.decode(resp_tokens[:valid_len], skip_special_tokens=True)
+        # sim.step may terminate early when external user_llm API is unavailable.
         user_reply, done = sim.step(npc_reply)
 
         current_ids = generated[:, :resp_end]

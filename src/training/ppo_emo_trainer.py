@@ -408,6 +408,13 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
         pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
         all_stats: list[dict[str, float]] = []
+        # Debug stats aggregated over all minibatches in this PPO step
+        adv_count = 0
+        adv_sum = 0.0
+        adv_sumsq = 0.0
+        ratio_count = 0
+        ratio_sum = 0.0
+        ratio_sumsq = 0.0
 
         for _epoch in range(ppo_epochs):
             random.shuffle(indices)
@@ -495,6 +502,19 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
                 surr2 = T.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * advantages
                 valid_count = adv_mask.sum().clamp(min=1e-8)
 
+                # --- Debug aggregates: adv / ratio mean & std on valid tokens ---
+                with T.no_grad():
+                    valid = adv_mask.to(dtype=T.bool)
+                    if valid.any():
+                        adv_v = advantages.detach()[valid]
+                        ratio_v = ratio.detach()[valid]
+                        adv_count += int(adv_v.numel())
+                        adv_sum += float(adv_v.sum().item())
+                        adv_sumsq += float((adv_v * adv_v).sum().item())
+                        ratio_count += int(ratio_v.numel())
+                        ratio_sum += float(ratio_v.sum().item())
+                        ratio_sumsq += float((ratio_v * ratio_v).sum().item())
+
                 pg_loss = -(T.minimum(surr1, surr2) * adv_mask).sum() / valid_count
                 entropy_loss = (entropy_resp * adv_mask).sum() / valid_count
                 _kl_ratio = new_lp_resp - ref_log_probs
@@ -531,7 +551,31 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
                 del full_ids, full_attn, full_resp_mask, new_log_probs, entropy_full, policy_loss, vf_loss
 
         avg_stats = {k: sum(s[k] for s in all_stats) / len(all_stats) for k in all_stats[0]} if all_stats else {}
-        reward_mean = sum(data["rewards"]) / len(data["rewards"]) if data["rewards"] else 0.0
+        # Token-level rewards are stored per sequence; reduce to scalar per sequence for logging
+        reward_scalars = [
+            float(r.sum().item()) for r in data.get("rewards", [])  # type: ignore[arg-type]
+        ]
+        if reward_scalars:
+            rewards_t = T.tensor(reward_scalars, dtype=T.float32)
+            reward_mean = float(rewards_t.mean().item())
+            reward_std = float(rewards_t.std(unbiased=False).item()) if rewards_t.numel() > 1 else 0.0
+            reward_max = float(rewards_t.max().item())
+        else:
+            reward_mean, reward_std, reward_max = 0.0, 0.0, 0.0
+
+        # Finalize debug stats for this step
+        if adv_count > 0:
+            adv_mean_dbg = adv_sum / adv_count
+            adv_var_dbg = max(0.0, adv_sumsq / adv_count - adv_mean_dbg * adv_mean_dbg)
+            adv_std_dbg = adv_var_dbg ** 0.5
+        else:
+            adv_mean_dbg, adv_std_dbg = 0.0, 0.0
+        if ratio_count > 0:
+            ratio_mean_dbg = ratio_sum / ratio_count
+            ratio_var_dbg = max(0.0, ratio_sumsq / ratio_count - ratio_mean_dbg * ratio_mean_dbg)
+            ratio_std_dbg = ratio_var_dbg ** 0.5
+        else:
+            ratio_mean_dbg, ratio_std_dbg = 0.0, 0.0
 
         if T.cuda.is_available():
             T.cuda.empty_cache()
@@ -547,12 +591,23 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
                 f"pg_clip={avg_stats.get('actor/pg_clipfrac', 0):.3f} "
                 f"vf_clip={avg_stats.get('critic/vf_clipfrac', 0):.3f} | {elapsed:.0f}s"
             )
+            print(
+                f"    [dbg] adv mean/std={adv_mean_dbg:.4f}/{adv_std_dbg:.4f} | "
+                f"ratio mean/std={ratio_mean_dbg:.4f}/{ratio_std_dbg:.4f} | "
+                f"reward mean/std/max={reward_mean:.4f}/{reward_std:.4f}/{reward_max:.4f}"
+            )
         avg_comp = {}
         if step_comp_stats:
             for k in step_comp_stats[0]:
                 avg_comp[k] = sum(s[k] for s in step_comp_stats) / len(step_comp_stats)
         monitor.log(step=global_step, metrics={
             "reward_mean": reward_mean,
+            "reward_std": reward_std,
+            "reward_max": reward_max,
+            "dbg/adv_mean": adv_mean_dbg,
+            "dbg/adv_std": adv_std_dbg,
+            "dbg/ratio_mean": ratio_mean_dbg,
+            "dbg/ratio_std": ratio_std_dbg,
             **avg_stats,
             **avg_comp,
             "elapsed": elapsed,

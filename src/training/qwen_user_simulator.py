@@ -27,6 +27,17 @@ TARGET_PROMPT = {
 }
 
 
+class InsufficientBalanceError(RuntimeError):
+    """Raised when the remote LLM API reports insufficient balance/quota."""
+
+
+def _looks_like_insufficient_balance(status_code: int, text: str) -> bool:
+    if status_code == 402:
+        return True
+    t = (text or "").lower()
+    return ("insufficient balance" in t) or ("余额不足" in text) or ("insufficient_quota" in t)
+
+
 def _call_qwen_api(
     messages: List[Dict[str, str]],
     api_key: str,
@@ -104,6 +115,11 @@ def _call_openai_compatible_api(
             if resp.status_code == 200:
                 data = resp.json()
                 return (data["choices"][0]["message"]["content"] or "").strip()
+            if _looks_like_insufficient_balance(resp.status_code, resp.text):
+                raise InsufficientBalanceError(
+                    f"API 错误 ({resp.status_code}): Insufficient Balance / quota. "
+                    f"{resp.text[:200]}"
+                )
             raise RuntimeError(f"API 错误 ({resp.status_code}): {resp.text[:200]}")
         except Exception as e:
             if attempt + 1 >= max_retries:

@@ -41,7 +41,7 @@ class PPOMemory:
         self.response_masks: List[T.Tensor] = []   # [response_len] each
         self.log_probs: List[T.Tensor] = []         # [response_len] each, current policy log prob
         self.values: List[T.Tensor] = []            # [response_len] each, critic value
-        self.rewards: List[float] = []              # scalar reward per sequence
+        self.rewards: List[T.Tensor] = []           # [response_len] each, token-level reward
         self.ref_log_probs: List[T.Tensor] = []     # [response_len] each, ref log prob for KL
 
     def store(
@@ -52,7 +52,7 @@ class PPOMemory:
         response_mask: T.Tensor,
         log_probs: T.Tensor,
         values: T.Tensor,
-        reward: float,
+        reward: T.Tensor,
         ref_log_probs: T.Tensor,
     ) -> None:
         """Store one rollout (can be a whole batch or per-item)."""
@@ -62,7 +62,7 @@ class PPOMemory:
         self.response_masks.append(response_mask.detach().cpu())
         self.log_probs.append(log_probs.detach().cpu())
         self.values.append(values.detach().cpu())
-        self.rewards.append(float(reward))
+        self.rewards.append(reward.detach().cpu())
         self.ref_log_probs.append(ref_log_probs.detach().cpu())
 
     def store_batch(
@@ -85,7 +85,7 @@ class PPOMemory:
                 response_mask[i],
                 log_probs[i],
                 values[i],
-                rewards[i].item(),
+                rewards[i],
                 ref_log_probs[i],
             )
 
@@ -108,29 +108,58 @@ class PPOMemory:
         last_value: Optional[T.Tensor] = None,
     ) -> Tuple[List[T.Tensor], List[T.Tensor]]:
         """
-        Compute advantage and return per sequence using GAE.
-        Returns (advantages, returns), both list of 1d tensors aligned with response length.
-        last_value: optional next value for bootstrap.
+        Compute advantage and return per sequence using token-level GAE, similar
+        to compute_gae_advantage_return in the reference repo:
+
+          delta_t = r_t + gamma * V_{t+1} - V_t
+          A_t     = delta_t + gamma * lam * A_{t+1}
+
+        where r_t is the per-token reward stored in self.rewards[i][t].
+
+        Returns (advantages, returns), both list of 1d tensors aligned with
+        response length. last_value is currently unused (episodes terminate at
+        end-of-sequence, no bootstrap).
         """
         advantages: List[T.Tensor] = []
         returns: List[T.Tensor] = []
 
+        def _masked_whiten(x: T.Tensor, mask: T.Tensor, eps: float = 1e-8) -> T.Tensor:
+            """Whiten x over positions where mask==1, analogous to verl_F.masked_whiten."""
+            mask_bool = mask.to(dtype=T.bool)
+            if not mask_bool.any():
+                return x
+            x_valid = x[mask_bool]
+            mean = x_valid.mean()
+            std = x_valid.std().clamp_min(eps)
+            out = x.clone()
+            out[mask_bool] = (x_valid - mean) / std
+            return out
+
         for i in range(len(self.rewards)):
-            r = self.rewards[i]
-            v = self.values[i]   # [response_len]
-            mask = self.response_masks[i]
+            token_rewards = self.rewards[i]          # [response_len]
+            v = self.values[i]                       # [response_len]
+            mask = self.response_masks[i]            # [response_len]
 
             v_dev = v.detach()
             mask_dev = mask.detach()
             length = int(mask_dev.sum().item())
+
+            # Ensure rewards on same device / dtype as values
+            token_rewards = token_rewards.to(v_dev.device).detach()
+
             adv = T.zeros_like(v_dev, device=v_dev.device)
-            gae = 0.0
+            lastgaelam = 0.0
+            # Reverse-time GAE over valid prefix [0, length)
             for t in reversed(range(length)):
-                r_t = float(r) if t == length - 1 else 0.0
-                next_v_val = v_dev[t+1] if t+1 < length else 0.0
-                adv[t] = r_t + self.gamma * next_v_val - v_dev[t]
-                gae = adv[t] + self.gamma * self.lam * gae
-                adv[t] = gae
+                r_t = float(token_rewards[t].item())
+                nextvalues = v_dev[t + 1] if t < length - 1 else 0.0
+                delta = r_t + self.gamma * nextvalues - v_dev[t]
+                lastgaelam = delta + self.gamma * self.lam * lastgaelam
+                adv[t] = lastgaelam
+
+            # Whiten advantages over valid positions, like verl_F.masked_whiten
+            adv = _masked_whiten(adv, mask_dev)
+
             advantages.append(adv)
             returns.append(adv + v)
 
