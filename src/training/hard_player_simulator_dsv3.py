@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import warnings
 from typing import Callable, Dict, Any, List, Optional, Tuple
 
 
@@ -147,6 +148,7 @@ class PlayerSimulatorWithPlanning:
         self.dialog: List[Dict[str, str]] = []
         self.emo_point_turns: List[float] = [self.emo_point]
         self._target_text = self._get_target_text()
+        self._player_llm_disabled = False
 
     def _get_target_text(self) -> str:
         from .qwen_user_simulator import TARGET_PROMPT
@@ -202,6 +204,7 @@ class PlayerSimulatorWithPlanning:
     def step(self, npc_reply: str) -> Tuple[str, bool]:
         """给定 NPC 回复，先 planning 分析情绪，再生成用户回复。"""
         from .emo_planning import planning_reply
+        from .qwen_user_simulator import InsufficientBalanceError
 
         npc_reply = (npc_reply or "").strip()
         if not npc_reply:
@@ -218,13 +221,36 @@ class PlayerSimulatorWithPlanning:
             "target": self.target,
         }
 
-        player_data, planning = planning_reply(player_data, self.planning_llm_fn, target_prompt=self.target)
-        self.emo_point = player_data["emo_point"]
-        self.emo_point_turns.append(self.emo_point)
+        try:
+            player_data, planning = planning_reply(player_data, self.planning_llm_fn, target_prompt=self.target)
+            self.emo_point = player_data["emo_point"]
+            self.emo_point_turns.append(self.emo_point)
+        except InsufficientBalanceError as e:
+            # planning API quota is exhausted; keep emo_point unchanged and proceed.
+            warnings.warn(
+                f"[PlayerSimulatorWithPlanning] planning_llm API insufficient balance; "
+                f"using neutral planning for this turn. ({e})"
+            )
+            planning = {"content": "", "reason": "", "activity": "", "analyse": "（planning不可用）", "change": 0}
 
         prompt = self._build_player_reply_prompt(planning)
-        raw_reply = self.player_llm_fn([{"role": "user", "content": prompt}])
-        user_reply = _parse_player_reply_response(raw_reply or "")
+        user_reply = ""
+        if self._player_llm_disabled:
+            user_reply = "再见。"
+        else:
+            try:
+                raw_reply = self.player_llm_fn([{"role": "user", "content": prompt}])
+                user_reply = _parse_player_reply_response(raw_reply or "")
+            except InsufficientBalanceError as e:
+                self._player_llm_disabled = True
+                warnings.warn(
+                    f"[PlayerSimulatorWithPlanning] user_llm API insufficient balance; "
+                    f"falling back to terminating reply for this episode. ({e})"
+                )
+                user_reply = "再见。"
+            except Exception:
+                # 对于其它错误，维持旧行为：抛出异常，便于尽早暴露配置/网络问题
+                raise
         self.dialog.append({"role": "user", "content": user_reply})
 
         done = self.emo_point <= 0 or bool(self.GOODBYE_PATTERN.search(user_reply))
@@ -242,10 +268,21 @@ class PlayerSimulatorWithPlanning:
 
     def generate_first_message(self) -> str:
         """生成开场白（首轮用户发言）。"""
+        from .qwen_user_simulator import InsufficientBalanceError
         planning = {"analyse": "请你以一个简短的回复开启倾诉"}
         prompt = self._build_player_reply_prompt(planning)
-        raw = self.player_llm_fn([{"role": "user", "content": prompt}])
-        return _parse_player_reply_response(raw or "") or "我最近有些事想和你聊聊。"
+        if self._player_llm_disabled:
+            return "我最近有些事想和你聊聊。"
+        try:
+            raw = self.player_llm_fn([{"role": "user", "content": prompt}])
+            return _parse_player_reply_response(raw or "") or "我最近有些事想和你聊聊。"
+        except InsufficientBalanceError as e:
+            self._player_llm_disabled = True
+            warnings.warn(
+                f"[PlayerSimulatorWithPlanning] user_llm API insufficient balance; "
+                f"using a default first message. ({e})"
+            )
+            return "我最近有些事想和你聊聊。"
 
     def reply(self, query: Optional[str]) -> Dict[str, str]:
         """

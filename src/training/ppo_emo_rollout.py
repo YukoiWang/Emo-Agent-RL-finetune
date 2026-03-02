@@ -465,23 +465,12 @@ def collect_rollouts_emo(
         warmup_steps=warmup_steps,
     )
 
-    # 标量 reward：取每条最后一个有效位置的值，用于 GAE
-    batch_size = gen_batch["response_ids"].size(0)
-    rewards_scalar = T.zeros(batch_size, dtype=T.float32, device=device)
-    for i in range(batch_size):
-        m = gen_batch["response_mask"][i]
-        length = int(m.sum().item())
-        if length > 0:
-            rewards_scalar[i] = original_reward_tensor[i, length - 1]
-        else:
-            rewards_scalar[i] = 0.0
-
     import os
     rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
     print(
         f"[rank{rank}] emo_points={emo_points} | "
-        f"resp_lengths={[int(gen_batch['response_mask'][i].sum().item()) for i in range(batch_size)]} | "
-        f"rewards={rewards_scalar.tolist()} | "
+        f"resp_lengths={[int(gen_batch['response_mask'][i].sum().item()) for i in range(gen_batch['response_ids'].size(0))]} | "
+        f"rewards_last_token={[float(original_reward_tensor[i, int(gen_batch['response_mask'][i].sum().item()) - 1].item()) if int(gen_batch['response_mask'][i].sum().item()) > 0 else 0.0 for i in range(gen_batch['response_ids'].size(0))]} | "
         f"turns={emo_point_turns_list}"
     )
 
@@ -499,7 +488,7 @@ def collect_rollouts_emo(
         gen_batch["response_mask"],
         gen_batch["log_probs"],
         gen_batch["values"],
-        rewards_scalar,
+        original_reward_tensor,
         ref_log_probs,
     )
 
