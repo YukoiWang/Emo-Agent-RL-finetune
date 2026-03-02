@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=emo-sft
-#SBATCH --partition=gpu
+#SBATCH --partition=RTX4090
 #SBATCH -N 1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
@@ -21,12 +21,11 @@ conda activate emo
 export PYTHONNOUSERSITE=1
 export WANDB_MODE=disabled
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=/home/yukiwang/.cache/huggingface
-export TRANSFORMERS_CACHE=/home/yukiwang/.cache/huggingface
+export HF_HOME=/home/ytwonng/.cache/huggingface
+export TRANSFORMERS_CACHE=/home/ytwong/.cache/huggingface
 export TOKENIZERS_PARALLELISM=false
 
-cd /home/yukiwang/Emo-Agent-RL-finetune
-mkdir -p logs
+cd /home/ytwong/Emo-Agent-RL-finetune
 
 echo "=== Job started at $(date) ==="
 echo "Node: $(hostname)"

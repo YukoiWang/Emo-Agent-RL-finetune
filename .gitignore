@@ -2,7 +2,6 @@
 emo_classifier_base/
 emo_classifier_lora/
 sft_emo_model/
-outputs/
 eval_tmp/
 eval_tmp_base/
 *.ckpt

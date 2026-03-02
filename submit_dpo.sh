@@ -38,12 +38,6 @@ echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/d
 echo "Python: $(python --version)"
 echo "================================"
 
-# 1. 若无偏好数据则先构建（使用本地 data/empathetic_dialogues/train.jsonl）
-PREF_FILE="static-rl/data/empathetic_preference.jsonl"
-if [[ ! -f "$PREF_FILE" ]]; then
-    echo "Building preference dataset from local train.jsonl..."
-    python static-rl/build_empathetic_preference_dataset.py --output "$PREF_FILE"
-fi
 
 # 2. 运行 DPO 训练（LoRA 默认；全量用 static-rl/configs/dpo_full.yaml）
 python static-rl/run_dpo.py --config static-rl/configs/dpo.yaml

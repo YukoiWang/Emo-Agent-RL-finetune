@@ -1,0 +1,54 @@
+seed: 42
+
+model:
+  sft_model_path: "/home/ytwong/Emo-Agent-RL-finetune/Qwen2.5-1.5B-Instruct"
+  dtype: "bfloat16"
+  use_lora: true
+
+data:
+  data_dir: "data/data"
+  train_file: "data/data/train_profile.jsonl"
+  batch_size: 1
+  max_scene_len: 800
+
+rollout:
+  max_turns: 5                       # 和 PPO 一致
+  max_new_tokens_per_turn: 128
+  use_planning_emo: true
+  # planning_service_url: "http://localhost:8770"
+  user_llm: "deepseek"
+  user_llm_model: "deepseek-chat"
+  planning_llm: "deepseek"
+  planning_llm_model: "deepseek-chat"
+  target: "eq"
+  temperature: 0.8
+  top_p: 0.95
+
+rl:
+  grpo:
+    num_generations: 8
+    learning_rate: 3.0e-6
+    epsilon: 0.2
+    beta: 0.02
+    gradient_accumulation_steps: 8
+    gradient_checkpointing: true
+    entropy_coeff: 0.001     
+    max_grad_norm: 1.0    
+
+reward:
+  type: "emo"
+  reward_mode: "mode1"                # 和 PPO 一致用 mode2
+  w1: 0.9                             # 和 PPO 一致
+  w2: 0.1                             # 和 PPO 一致
+  w3: 0
+  trend_n: 5
+  S1: 100
+  S2: 300
+  warmup_steps: 200
+
+training:
+  output_dir: "outputs/grpo_emo_mode1"
+  total_steps: 500                    # 和 PPO 一致方便对比
+  logging_steps: 1
+  save_steps: 50
+  save_total_limit: 20

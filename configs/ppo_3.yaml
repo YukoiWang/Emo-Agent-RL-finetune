@@ -1,0 +1,71 @@
+seed: 42
+
+model:
+  sft_model_path: "/home/ytwong/Emo-Agent-RL-finetune/Qwen2.5-1.5B-Instruct"
+  dtype: "bfloat16"
+  use_lora: true
+
+data:
+  data_dir: "data/data"
+  train_file: "data/data/train_profile.jsonl"
+  batch_size: 2                  
+  max_scene_len: 800
+  max_prompt_length: 256
+  max_response_length: 128
+  num_proc: 1
+
+rollout:
+  max_turns: 5                    
+  max_new_tokens_per_turn: 128     # 128 token，回复更充分
+  use_planning_emo: true
+  # planning_service_url: "http://localhost:8769"
+  user_llm: "deepseek"
+  user_llm_model: "deepseek-chat"
+  planning_llm: "deepseek"
+  planning_llm_model: "deepseek-chat"
+  target: "eq"
+  temperature: 0.8
+  top_p: 0.95
+
+rl:
+  algo: "ppo"
+  ppo:
+    # --- 基础 PPO ---
+    ppo_epochs: 3
+    mini_batch_size: 2
+    gamma: 1.0
+    lam: 0.95
+
+    # --- 学习率 ---
+    learning_rate: 1.0e-6          # actor lr，比之前的 5e-6 保守一点
+    critic_learning_rate: 5.0e-6   # critic 3倍于 actor，加速 value 拟合
+
+    # --- Clipping ---
+    clip_range: 0.2                # 策略 clip，标准值
+    clip_range_value: 0.2          # value clip，和 clip_range 一致
+
+    # --- 正则化 ---
+    kl_penalty_coef: 0        
+    entropy_coeff: 0.001           # LLM vocab 大，entropy 天然高，给小一点
+
+    # --- 稳定性 ---
+    max_grad_norm: 1.0             # 标准值
+    gradient_checkpointing: true   # 省显存
+
+reward:
+  type: "emo"
+  reward_mode: "mode1"
+  w1: 0.9
+  w2: 0.1
+  w3: 0
+  trend_n: 5
+  S1: 100
+  S2: 300
+  warmup_steps: 200
+
+training:
+  output_dir: "outputs/ppo_emo_train_mode1"
+  total_steps: 500
+  logging_steps: 1               
+  save_steps: 50              
+  save_total_limit: 20
