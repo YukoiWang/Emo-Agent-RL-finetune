@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Reward 为函数（非 reward model）：根据对话结束时的 emo_point（及可选每轮 emo 序列）计算 reward。
-支持三种模式（通过参数切换）：
+支持四种模式（通过参数切换）：
 - 模式1：reward = 最终 emo_point/100，sparse（只在序列最后一个有效 token 位置非零）。
 - 模式2：r_total = w1*baseline_emotion + w2*trend_reward - w3*volatility_penalty。
 - 模式3（三段式）：alpha/beta 随 step warmup，reward = baseline + alpha*w2*trend - beta*w3*volatility。
+- 模式4：step < S1 时 reward = baseline；step >= S1 时 reward = 仅 trend（不要 baseline、不要 volatility）。
 """
 from __future__ import annotations
 
@@ -52,7 +53,7 @@ def build_reward_fn_emo(
 
     def reward_fn(texts: List[str]) -> List[float]:
         emo_points = _emo_points_from_texts(texts)
-        step = step_fn() if step_fn and reward_mode == "mode3" else 0
+        step = step_fn() if step_fn and reward_mode in ("mode3", "mode4") else 0
         rewards = []
         for emo in emo_points:
             baseline = max(0.0, emo / 100.0)
@@ -65,6 +66,13 @@ def build_reward_fn_emo(
                 trend_r = _trend_reward(turns, n=trend_n)
                 vol_p = _volatility_penalty(turns, n=trend_n)
                 r = baseline + alpha * w2 * trend_r - beta * w3 * vol_p
+                r = max(0.0, min(1.0, r))
+            elif reward_mode == "mode4":
+                trend_r = _trend_reward(turns, n=trend_n)
+                if step_fn and step < S1:
+                    r = baseline
+                else:
+                    r = float(np.clip(trend_r * w2, 0.0, 1.0))  # S1 之后只要 trend
                 r = max(0.0, min(1.0, r))
             else:
                 trend_r = _trend_reward(turns, n=trend_n)
@@ -126,11 +134,10 @@ def compute_reward_tensors(
     response_mask: (batch, resp_len)，1 表示有效 token
     emo_points: 长度为 batch 的列表，每个为对话结束时的 emo_point [0,100]
     emo_point_turns_list: mode2/mode3 时每条的每轮 emo_point 序列
-    reward_mode: "mode1" / "mode2" / "mode3"
+    reward_mode: "mode1" / "mode2" / "mode3" / "mode4"
     w1, w2, w3: baseline / trend / volatility 权重
     trend_n: 计算趋势和波动使用的最近轮数
-    step, S1, S2, warmup_steps: 仅 mode3。alpha = clamp((step-S1)/warmup_steps,0,1), beta = clamp((step-S2)/warmup_steps,0,1)，
-        reward = baseline + alpha*w2*trend - beta*w3*volatility
+    step, S1, S2, warmup_steps: mode3 用全部；mode4 仅用 step, S1（S1 之后只给 trend）。
 
     返回 (original_reward_tensor, penalized_reward_tensor)，形状均为 (batch, resp_len)。
     """
@@ -139,7 +146,7 @@ def compute_reward_tensors(
     if device is None:
         device = response_ids.device
 
-    # mode3 的 alpha, beta
+    # mode3 的 alpha, beta；mode4 仅用 step/S1 做切换
     alpha, beta = 0.0, 0.0
     if reward_mode == "mode3" and step is not None and S1 is not None and S2 is not None and warmup_steps is not None and warmup_steps > 0:
         alpha = _clamp01((step - S1) / warmup_steps)
@@ -158,6 +165,13 @@ def compute_reward_tensors(
             vol_p = _volatility_penalty(turns, n=trend_n)
             r = baseline + alpha * w2 * trend_r - beta * w3 * vol_p
             # r = min(1.0, r)
+        elif reward_mode == "mode4":
+            turns = (emo_point_turns_list or [])[i] if emo_point_turns_list and i < len(emo_point_turns_list) else [emo]
+            trend_r = _trend_reward(turns, n=trend_n)
+            if step is not None and S1 is not None and step < S1:
+                r = baseline
+            else:
+                r = _clamp01(trend_r * w2)  # S1 之后只要 trend，不要 baseline
         else:
             # mode2
             turns = (emo_point_turns_list or [])[i] if emo_point_turns_list and i < len(emo_point_turns_list) else [emo]

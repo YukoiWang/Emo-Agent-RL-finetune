@@ -1,14 +1,14 @@
 seed: 42
 
 model:
-  sft_model_path: "/home/ytwong/Emo-Agent-RL-finetune/Qwen2.5-1.5B-Instruct"
+  sft_model_path: "Qwen/Qwen2.5-1.5B-Instruct"
   dtype: "bfloat16"
   use_lora: true
 
 data:
   data_dir: "data/data"
   train_file: "data/data/train_profile.jsonl"
-  batch_size: 8                  
+  batch_size: 2                  
   max_scene_len: 800
   max_prompt_length: 256
   max_response_length: 128
@@ -54,9 +54,9 @@ rl:
 
 reward:
   type: "emo"
-  reward_mode: "mode2"
-  w1: 0.9
-  w2: 0.3
+  reward_mode: "mode4"
+  w1: 1.0
+  w2: 1.0
   w3: 0.2
   trend_n: 5
   S1: 100
@@ -64,7 +64,8 @@ reward:
   warmup_steps: 200
 
 training:
-  output_dir: "outputs/ppo_emo_train_mode2_910_2"
+  output_dir: "outputs/ppo_emo_train_mode4"
+  resume_from_checkpoint: "outputs/ppo_emo_train_mode4/checkpoint-50"
   # resume_from_checkpoint: 
   total_steps: 500
   logging_steps: 1               

@@ -67,6 +67,28 @@ def compute_per_turn_emo_stats(
     return {"mean": means, "std": stds}
 
 
+def compute_emo_volatility(dialogues: List[DialogueResult]) -> float:
+    """
+    对话级情绪波动指标：
+    - 对每个对话，计算相邻轮次 emo_point 差分的标准差；
+    - 再对所有对话的该值取平均。
+    """
+    vols = []
+    for d in dialogues:
+        traj = d.emo_point_trajectory
+        if len(traj) < 2:
+            continue
+        deltas = [traj[i + 1] - traj[i] for i in range(len(traj) - 1)]
+        if not deltas:
+            continue
+        m = sum(deltas) / len(deltas)
+        v = sum((x - m) ** 2 for x in deltas) / len(deltas)
+        vols.append(v ** 0.5)
+    if not vols:
+        return 0.0
+    return sum(vols) / len(vols)
+
+
 def evaluate_level1(dialogues: List[DialogueResult]) -> Dict[str, object]:
     """Run all Level-1 metrics."""
     return {
@@ -74,5 +96,6 @@ def evaluate_level1(dialogues: List[DialogueResult]) -> Dict[str, object]:
         "avg_emo_change": compute_avg_emo_change(dialogues),
         "emo_change_distribution": compute_emo_change_distribution(dialogues),
         "per_turn_emo_stats": compute_per_turn_emo_stats(dialogues),
+        "emo_volatility": compute_emo_volatility(dialogues),
         "n_dialogues": len(dialogues),
     }
