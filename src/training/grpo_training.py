@@ -390,6 +390,11 @@ def _compute_emo_reward_scalar(
         trend_r = _trend_reward(turns, n=trend_n)
         vol_p = _volatility_penalty(turns, n=trend_n)
         return min(1.0, baseline + alpha * w2 * trend_r - beta * w3 * vol_p)
+    elif reward_mode == "mode4":
+        trend_r = _trend_reward(turns, n=trend_n)
+        if step < S1:
+            return baseline
+        return min(1.0, max(0.0, trend_r * w2))
     else:  # mode2
         trend_r = _trend_reward(turns, n=trend_n)
         vol_p = _volatility_penalty(turns, n=trend_n)

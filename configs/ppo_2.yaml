@@ -15,7 +15,7 @@ data:
   num_proc: 1
 
 rollout:
-  max_turns: 5                    
+  max_turns: 8                    
   max_new_tokens_per_turn: 128     # 128 token，回复更充分
   use_planning_emo: true
   # planning_service_url: "http://localhost:8769"
@@ -37,8 +37,8 @@ rl:
     lam: 0.95
 
     # --- 学习率 ---
-    learning_rate: 1.0e-6          # actor lr，比之前的 5e-6 保守一点
-    critic_learning_rate: 5.0e-6   # critic 3倍于 actor，加速 value 拟合
+    learning_rate: 5.0e-6          # actor lr，比之前的 5e-6 保守一点
+    critic_learning_rate: 1.0e-5   # critic 3倍于 actor，加速 value 拟合
 
     # --- Clipping ---
     clip_range: 0.2                # 策略 clip，标准值
@@ -55,16 +55,16 @@ rl:
 reward:
   type: "emo"
   reward_mode: "mode2"
-  w1: 0.9
-  w2: 0.1
-  w3: 0.1
+  w1: 1.0
+  w2: 0
+  w3: 0.2
   trend_n: 5
   S1: 100
   S2: 300
   warmup_steps: 200
 
 training:
-  output_dir: "outputs/ppo_emo_train_mode2_911"
+  output_dir: "outputs/ppo_emo_train_mode2_132"
   total_steps: 500
   logging_steps: 1               
   save_steps: 50              

@@ -446,7 +446,7 @@ def collect_rollouts_emo(
     non_tensor = gen_batch.get("non_tensor_batch") or {}
     emo_points = non_tensor.get("emo_point", [0.0] * len(batch_items))
     emo_point_turns_list = non_tensor.get("emo_point_turns", [])
-    use_turns = reward_mode in ("mode2", "mode3")
+    use_turns = reward_mode in ("mode2", "mode3", "mode4")
 
     original_reward_tensor, penalized_reward_tensor = compute_reward_tensors(
         response_ids=gen_batch["response_ids"],

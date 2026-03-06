@@ -362,6 +362,9 @@ def run_ppo_emo_training(cfg: Dict[str, Any]) -> None:
                 collect_kw["S1"] = reward_cfg.get("S1", 100)
                 collect_kw["S2"] = reward_cfg.get("S2", 300)
                 collect_kw["warmup_steps"] = reward_cfg.get("warmup_steps", 200)
+            elif reward_mode == "mode4":
+                collect_kw["step"] = global_step
+                collect_kw["S1"] = reward_cfg.get("S1", 100)
 
             _, _, comp_stats = collect_rollouts_emo(**collect_kw)
             step_comp_stats.append(comp_stats)
