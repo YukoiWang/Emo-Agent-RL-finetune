@@ -31,3 +31,6 @@ logs/
 # 系统
 .DS_Store
 Thumbs.db
+/outputs/
+/*.jsonl
+/*.sh
